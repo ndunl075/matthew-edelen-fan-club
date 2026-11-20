@@ -180,10 +180,10 @@ class Bot:
         tune = self.tune
         act = {"tick": obs["tick"], "fire": [False, False]}
         if obs["offer"]:
-            act["pick"] = 0  # TODO: choose upgrades
+            act["pick"] = self.pick_upgrade(obs["offer"])
 
         weapons = me["weapons"]
-        pickup = None  # TODO: weapon pickups
+        pickup = self.loot_action(obs, me, act)
         tgt = self.pick_target(obs)
         drop = self.drop_goal(obs, me)
         stuck = self.check_stuck(me)
