@@ -21,8 +21,10 @@ def worst_slot(weapons: list, p: Params) -> int | None:
     return best
 
 def take_plan(kind: str, weapons: list, p: Params, laser_threat: bool) -> tuple[bool, int | None]:
-    if kind in held_kinds(weapons) or kind not in list(p.weapons.rank):
+    if kind in held_kinds(weapons) or kind not in list(p.weapons.rank) or kind in list(p.loot.skip_kinds):
         return (False, None)
+    if kind == 'lightning' and p.loot.lightning_only_if_free:
+        return (any((w is None for w in weapons)) and 'laser' not in held_kinds(weapons), None)
     if kind == 'mortar' and laser_threat:
         return (False, None)
     if any((w is None for w in weapons)):

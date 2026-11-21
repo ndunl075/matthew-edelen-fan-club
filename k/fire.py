@@ -180,6 +180,8 @@ class Gunnery:
         if ctl == 'wait' and charge <= 0:
             return False
         if charge > 0:
+            if aligned and charge >= laser['min_charge'] and self.partial_kills(v, e, charge, full):
+                return False
             extra = q.laser_max_extra_s if clear else laser['hold_s'] - self.dt - q.laser_slack_s
             release = aimmod.laser_release(charge, full, laser['min_charge'], aligned, threatened, q.laser_slack_s, q.laser_early_frac, extra)
             return not release
@@ -190,6 +192,21 @@ class Gunnery:
         m = self.cfg['mech']
         turn = aimmod.slew_time(v.aim, p.sol.aim, stats.get('turn_rate', m['turn_rate']), stats.get('pitch_rate', m['pitch_rate']), stats.get('min_pitch', m['min_pitch']), stats.get('max_pitch', m['max_pitch']))
         return known and (aligned or turn <= full * q.precharge_slew_frac)
+
+    def laser_damage_at(self, v: View, charge: float, full: float, st: dict) -> float:
+        laser = self.cfg['weapons']['laser']
+        frac = laser['min_frac'] + (1.0 - laser['min_frac']) * min(max(charge / max(full, 1e-06), 0.0), 1.0)
+        c = self.cfg['cubes']
+        mult = 1.0 + c['damage_per_cube'] * min(max(v.me.get('cubes', 0), 0), c['stat_cap'])
+        return st.get('damage', laser['damage']) * mult * frac
+
+    def partial_kills(self, v: View, e: Enemy, charge: float, full: float) -> bool:
+        hp = e.tr.hp
+        if hp is None or e.prop or charge >= full:
+            return False
+        laser = next((w for w in v.weapons if w and w['kind'] == 'laser'), None)
+        st = laser['stats'] if laser else self.cfg['weapons']['laser']
+        return self.p.fire.laser_partial_conf * self.laser_damage_at(v, charge, full, st) >= hp
 
     def _lane_clear(self, v: View, target: Enemy) -> bool:
         cone = math.radians(self.cfg['weapons']['lightning']['cone_deg'])

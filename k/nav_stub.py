@@ -52,6 +52,9 @@ class NavStub:
     def open_ground(self, xy) -> bool:
         return True
 
+    def step_clear(self, a_xy, b_xy) -> bool:
+        return True
+
     def reset(self) -> None:
         self._hist.clear()
         self._rec_since = None

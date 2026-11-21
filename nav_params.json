@@ -1,0 +1,81 @@
+{
+  "grid": {
+    "clearance_margin_m": 0.5,
+    "near_wall_extra_m": 2.0,
+    "near_wall_cost": 0.4,
+    "open_ground_radii": 3.0,
+    "open_ground_flat_m": 1.5,
+    "link_reach_m": 24.0,
+    "jet_clearance_m": 1.0,
+    "jump_margin_m": 0.6,
+    "climb_safety": 0.92,
+    "link_penalty_m": 12.0,
+    "jet_penalty_m": 25.0,
+    "min_roof_height_m": 3.0,
+    "cross_free_m": 6.0,
+    "cross_m_per_m": 1.0,
+    "cover_reach_m": 16.0
+  },
+  "search": {
+    "weight": 1.15,
+    "steer_budget": 260,
+    "length_budget": 300,
+    "snap_max_m": 14.0,
+    "length_cache": 256
+  },
+  "steer": {
+    "lookahead_m": 10.0,
+    "slow_m": 6.0,
+    "arrive_m": 1.2,
+    "replan_goal_m": 6.0,
+    "replan_off_path_m": 8.0,
+    "replan_every_s": 20.0,
+    "node_reach_m": 2.5,
+    "boost_min_energy_frac": 0.7,
+    "boost_min_remaining_m": 60.0,
+    "link_reach_m": 1.6,
+    "stuck_window_s": 1.0,
+    "stuck_frac": 0.25,
+    "block_ttl_s": 8.0,
+    "recover_s": 0.7,
+    "drop_speed_frac": 0.5
+  },
+  "cover": {
+    "max_checks": 4,
+    "chunk": 96,
+    "margin_m": 1.2,
+    "cache": 32,
+    "path_slack": 1.6,
+    "max_rays": 700
+  },
+  "peek": {
+    "step_m": 5.0,
+    "stride": 2,
+    "cache": 16,
+    "max_hidden": 8
+  },
+  "pockets": {
+    "min_area_m2": 60.0,
+    "min_wall_rise_mult": 1.0,
+    "max_visible_share": 0.12,
+    "drop_clear_m": 2.0,
+    "wall_percentile": 10.0,
+    "ray_m": 16
+  },
+  "roofs": {
+    "candidates": 5,
+    "vis_weight_m": 220.0,
+    "depth_bonus_m": 3.0,
+    "depth_bonus_cap_m": 12.0,
+    "peek_behind_m": [
+      3.0,
+      3.5,
+      4.0
+    ],
+    "peek_tries": 24,
+    "peek_radius_m": 70.0,
+    "stand_back_m": 6.0,
+    "site_min_height_m": 12.0,
+    "site_points": 4
+  }
+}
