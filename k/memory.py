@@ -1,0 +1,354 @@
+from __future__ import annotations
+import math
+import random
+from collections import deque
+from dataclasses import dataclass, field
+from .params import Params
+from .util import angdiff, dist2
+QUIET_KINDS = ('npc_gun', 'crate', 'drop')
+_DIST_RANK = {'near': 0, 'mid': 1, 'far': 2}
+FIRST_CRATE_ID = 1000
+
+@dataclass
+class Track:
+    id: int
+    kind: str
+    pos: list
+    vel: list
+    aim: list
+    hp: float | None = None
+    max_hp: float | None = None
+    cubes: int = 0
+    weapons: set = field(default_factory=set)
+    charging: bool = False
+    first_seen: float = 0.0
+    last_seen: float = 0.0
+    listed: bool = True
+
+    def age(self, t: float) -> float:
+        return t - self.last_seen
+
+@dataclass
+class DamageRec:
+    t: float
+    amount: float
+    weapon: str
+    bearing: float | None
+    by: int | None
+    rear: bool
+
+@dataclass
+class SoundRec:
+    t: float
+    kind: str
+    bearing: float
+    dist: str
+    x: float
+    y: float
+    ex: float
+    ey: float
+
+@dataclass
+class PickupRec:
+    id: int
+    kind: str
+    pos: list
+    last_seen: float
+
+@dataclass
+class ItemRec:
+    id: int
+    pos: list
+    hp: float | None
+    last_seen: float
+
+@dataclass
+class BeamRec:
+    t: float
+    by: int
+    kind: str
+    path: list
+
+def _nearest(items: list, cap: int, x: float, y: float) -> list:
+    if len(items) <= cap:
+        return items
+    return sorted(items, key=lambda it: math.hypot(it['pos'][0] - x, it['pos'][1] - y))[:cap]
+
+def _cap(store: dict, cap: int, x: float, y: float) -> None:
+    if len(store) <= cap:
+        return
+    keep = sorted(store.values(), key=lambda r: (-r.last_seen, dist2(r.pos, (x, y))))[:cap]
+    kept = {id(r) for r in keep}
+    for rid in [i for i, r in store.items() if id(r) not in kept]:
+        del store[rid]
+
+class Memory:
+
+    def __init__(self, hello: dict, params: Params):
+        self.p = params
+        self.cfg = hello['config']
+        self.slot = int(hello.get('slot', 0))
+        self.rng = random.Random(int(hello.get('seed', 0)))
+        self.t = 0.0
+        self.tick = 0
+        self.pos = [0.0, 0.0, 0.0]
+        self.aim = [0.0, 0.0]
+        self.tracks: dict[int, Track] = {}
+        self.damage_log: deque[DamageRec] = deque(maxlen=64)
+        self.hit_log: deque[tuple] = deque(maxlen=64)
+        self.sounds: list[SoundRec] = []
+        self.pickups: dict[int, PickupRec] = {}
+        self.cubes: dict[int, ItemRec] = {}
+        self.crates: dict[int, ItemRec] = {}
+        self.drops: list[dict] = []
+        self.projectiles: list[dict] = []
+        self.beams: list[BeamRec] = []
+        self.take_block: dict[int, float] = {}
+        self.kind_block: dict[str, float] = {}
+        self._missing: dict[int, float] = {}
+        self._los = None
+        self._los_real = False
+        self._los_budget = 0
+        self.goal_block: list[tuple] = []
+        self.last_combat_t = -1000000000.0
+        self.last_hurt_t = -1000000000.0
+        self.shorted_until = -1000000000.0
+        self.kills = 0
+        self.last_kill_t = -1000000000.0
+        self.last_kill_pos: list | None = None
+        self.last_contact_t = 0.0
+        self._blind: dict[tuple, list] = {}
+
+    def update(self, obs: dict) -> None:
+        self.t = float(obs['t'])
+        self.tick = int(obs['tick'])
+        self.pos = list(obs['self']['pos'])
+        self.aim = list(obs['self'].get('aim', self.aim))
+        self._events(obs.get('events', []))
+        self._mechs(obs.get('mechs', []))
+        self._sounds(obs.get('sounds', []))
+        if any((m.get('kind', 'mech') == 'mech' for m in obs.get('mechs', []))) or any((s.get('kind') not in QUIET_KINDS for s in obs.get('sounds', []))):
+            self.last_contact_t = self.t
+        self._items(obs)
+        self._beams(obs.get('beams', []))
+        self.drops = list(obs.get('drops', []))
+        self.projectiles = list(obs.get('projectiles', []))
+        self._prune()
+
+    def _events(self, events: list) -> None:
+        t = self.t
+        for e in events:
+            kind = e.get('type')
+            if kind == 'damaged':
+                by = e.get('by')
+                self.damage_log.append(DamageRec(t, float(e['amount']), e.get('weapon', ''), e.get('bearing'), None if by is None else int(by), bool(e.get('rear', False))))
+                self.last_hurt_t = t
+                if by is not None:
+                    self.last_combat_t = t
+            elif kind == 'hit':
+                tgt = int(e['target'])
+                if tgt < FIRST_CRATE_ID:
+                    self.last_combat_t = t
+                self.hit_log.append((t, tgt, float(e['amount']), e.get('weapon', '')))
+                self.record_hit(tgt)
+            elif kind == 'kill':
+                self.kills += 1
+                dead = self.tracks.pop(int(e['target']), None)
+                self.last_kill_t = t
+                self.last_kill_pos = list(self.est_pos(dead)) if dead is not None else None
+            elif kind == 'took':
+                self.pickups.pop(int(e['id']), None)
+            elif kind == 'dropped':
+                self.pickups[int(e['id'])] = PickupRec(int(e['id']), e['kind'], list(self.pos), t)
+                self.take_block[int(e['id'])] = t + self.p.memory.dropped_block_s
+            elif kind == 'take_failed':
+                pid = int(e['id'])
+                if e.get('reason') == 'gone':
+                    self.pickups.pop(pid, None)
+                else:
+                    self.take_block[pid] = t + self.p.memory.take_block_s
+            elif kind == 'effect' and e.get('effect') == 'short':
+                self.shorted_until = t + float(self.cfg['weapons']['lightning']['short_s'])
+
+    def _mechs(self, mechs: list) -> None:
+        t = self.t
+        for tr in self.tracks.values():
+            tr.listed = False
+        for m in mechs:
+            mid = int(m['id'])
+            tr = self.tracks.get(mid)
+            if tr is None:
+                tr = Track(mid, m.get('kind', 'mech'), list(m['pos']), list(m['vel']), list(m['aim']), first_seen=t)
+                self.tracks[mid] = tr
+            tr.pos, tr.vel, tr.aim = (list(m['pos']), list(m['vel']), list(m['aim']))
+            tr.hp = m.get('hp', tr.hp)
+            tr.max_hp = m.get('max_hp', tr.max_hp)
+            tr.cubes = int(m.get('cubes', tr.cubes) or 0)
+            if 'weapons' in m:
+                tr.weapons = set(m['weapons'])
+            tr.charging = bool(m.get('charging', False))
+            tr.last_seen = t
+            tr.listed = True
+
+    def _sounds(self, sounds: list) -> None:
+        dists = self.p.memory.sound_dist_m
+        x, y = (self.pos[0], self.pos[1])
+        cap = int(self.p.memory.max_sounds)
+        if len(sounds) > cap:
+            sounds = sorted(sounds, key=lambda s: (_DIST_RANK.get(s.get('dist'), 1), s.get('age', 0.0)))[:cap]
+        for s in sounds:
+            d = getattr(dists, s['dist'], dists.mid)
+            b = float(s['bearing'])
+            self.sounds.append(SoundRec(self.t - float(s.get('age', 0.0)), s['kind'], b, s['dist'], x, y, x + d * math.cos(b), y + d * math.sin(b)))
+
+    def _looked_at(self, pos) -> bool:
+        p, vis = (self.p.memory, self.cfg['vision'])
+        d = dist2(pos, self.pos)
+        if d > min(p.look_forget_m, float(vis['range'])):
+            return False
+        half = math.radians(float(vis['fov_deg'])) / 2.0 - math.radians(p.look_margin_deg)
+        bearing = math.atan2(pos[1] - self.pos[1], pos[0] - self.pos[0])
+        return abs(angdiff(bearing, self.aim[0])) <= half
+
+    def set_sight(self, los, real: bool) -> None:
+        self._los, self._los_real = (los, bool(real))
+
+    def _sight_ok(self, pos) -> bool:
+        if self._los is None or not self._los_real:
+            return True
+        if self._los_budget <= 0:
+            return False
+        self._los_budget -= 1
+        eye = (self.pos[0], self.pos[1], self.pos[2] + float(self.cfg['mech']['eye_height']))
+        return bool(self._los(eye, (pos[0], pos[1], pos[2] + 0.5)))
+
+    def _gone(self, iid: int, pos, expected: bool) -> bool:
+        if not (expected and self._sight_ok(pos)):
+            self._missing.pop(iid, None)
+            return False
+        m = self.p.memory
+        since = self._missing.setdefault(iid, self.t)
+        return self.t - since >= (m.forget_missing_s if self._los_real else m.forget_missing_stub_s)
+
+    def _items(self, obs: dict) -> None:
+        t = self.t
+        x, y = (self.pos[0], self.pos[1])
+        m = self.p.memory
+        self._los_budget = int(m.max_los_checks)
+        listed = set()
+        for pk in _nearest(obs.get('pickups', []), int(m.max_pickups), x, y):
+            listed.add(int(pk['id']))
+            self._missing.pop(int(pk['id']), None)
+            self.pickups[int(pk['id'])] = PickupRec(int(pk['id']), pk['kind'], list(pk['pos']), t)
+        for pid in [i for i, r in self.pickups.items() if i not in listed and r.last_seen < t and self._gone(i, r.pos, dist2(r.pos, (x, y)) < m.pickup_forget_m or self._looked_at(r.pos))]:
+            del self.pickups[pid]
+            self._missing.pop(pid, None)
+        _cap(self.pickups, int(m.max_pickups), x, y)
+        for store, key, forget, cap in ((self.cubes, 'cubes', m.cube_forget_m, int(m.max_cubes)), (self.crates, 'crates', m.crate_forget_m, int(m.max_crates))):
+            seen = set()
+            for it in _nearest(obs.get(key, []), cap, x, y):
+                seen.add(int(it['id']))
+                self._missing.pop(int(it['id']), None)
+                store[int(it['id'])] = ItemRec(int(it['id']), list(it['pos']), it.get('hp'), t)
+            for iid in [i for i, r in store.items() if i not in seen and r.last_seen < t and self._gone(i, r.pos, dist2(r.pos, (x, y)) < forget or self._looked_at(r.pos))]:
+                del store[iid]
+                self._missing.pop(iid, None)
+            _cap(store, cap, x, y)
+        if len(self._missing) > 4 * int(m.max_pickups):
+            alive = set(self.pickups) | set(self.cubes) | set(self.crates)
+            self._missing = {i: v for i, v in self._missing.items() if i in alive}
+
+    def _beams(self, beams: list) -> None:
+        for b in beams:
+            by = int(b['by'])
+            self.beams.append(BeamRec(self.t - float(b.get('age', 0.0)), by, b['kind'], list(b['path'])))
+            tr = self.tracks.get(by)
+            if tr is not None:
+                tr.weapons.add(b['kind'])
+
+    def _prune(self) -> None:
+        t, p = (self.t, self.p.memory)
+        self.sounds = [s for s in self.sounds if t - s.t <= p.sound_keep_s]
+        cap = int(p.max_sounds)
+        if len(self.sounds) > cap:
+            newest = sorted(self.sounds, key=lambda s: -s.t)
+            keep, rest = (newest[:cap // 2], newest[cap // 2:])
+            x, y = (self.pos[0], self.pos[1])
+            rest.sort(key=lambda s: math.hypot(s.ex - x, s.ey - y))
+            keep += rest[:cap - len(keep)]
+            self.sounds = sorted(keep, key=lambda s: s.t)
+        self.beams = [b for b in self.beams if t - b.t <= p.beam_keep_s]
+        for tid in [i for i, tr in self.tracks.items() if t - tr.last_seen > p.track_keep_s]:
+            del self.tracks[tid]
+        for pid in [i for i, until in self.take_block.items() if until < t]:
+            del self.take_block[pid]
+        for k in [k for k, until in self.kind_block.items() if until < t]:
+            del self.kind_block[k]
+        self.goal_block = [g for g in self.goal_block if g[2] >= t][-16:]
+
+    def block_goal(self, pos, seconds: float) -> None:
+        self.goal_block.append((pos[0], pos[1], self.t + seconds))
+
+    def is_blocked(self, pos) -> bool:
+        r = self.p.stuck.block_radius_m
+        return any((g[2] >= self.t and math.hypot(pos[0] - g[0], pos[1] - g[1]) <= r for g in self.goal_block))
+
+    def est_pos(self, tr: Track, t: float | None=None) -> list:
+        t = self.t if t is None else t
+        age = max(0.0, t - tr.last_seen)
+        if age <= 0.0:
+            return list(tr.pos)
+        a = min(age, self.p.memory.stale_drift_s)
+        return [tr.pos[0] + tr.vel[0] * a, tr.pos[1] + tr.vel[1] * a, tr.pos[2]]
+
+    def mechs(self, max_age: float | None=None) -> list[Track]:
+        max_age = self.p.memory.track_keep_s if max_age is None else max_age
+        return [tr for tr in self.tracks.values() if tr.kind == 'mech' and self.t - tr.last_seen <= max_age]
+
+    def drones(self, max_age: float | None=None) -> list[Track]:
+        max_age = self.p.memory.drone_keep_s if max_age is None else max_age
+        return [tr for tr in self.tracks.values() if tr.kind == 'npc' and self.t - tr.last_seen <= max_age]
+
+    def recent_damage(self, window: float) -> list[DamageRec]:
+        return [d for d in self.damage_log if self.t - d.t <= window]
+
+    def damage_by(self, window: float) -> dict[int, float]:
+        out: dict[int, float] = {}
+        for d in self.recent_damage(window):
+            if d.by is not None:
+                out[d.by] = out.get(d.by, 0.0) + d.amount
+        return out
+
+    def recent_sounds(self, window: float, kinds: tuple | None=None) -> list[SoundRec]:
+        return [s for s in self.sounds if self.t - s.t <= window and (kinds is None or s.kind in kinds)]
+
+    def hit_recently(self, target: int, window: float) -> bool:
+        return any((h[1] == target and self.t - h[0] <= window for h in self.hit_log))
+
+    def laser_threat(self) -> bool:
+        p = self.p.loot
+        me = self.pos
+        for tr in self.mechs(p.laser_memory_s):
+            if 'laser' in tr.weapons and dist2(self.est_pos(tr), me) <= p.laser_threat_range_m:
+                return True
+        for s in self.recent_sounds(p.laser_sound_s, ('laser', 'laser_charge')):
+            if s.dist in ('near', 'mid'):
+                return True
+        return any((self.t - b.t <= p.laser_memory_s and b.kind == 'laser' for b in self.beams))
+
+    def record_shot(self, target: int, kind: str) -> None:
+        rec = self._blind.setdefault((target, kind), [0, -1000000000.0])
+        rec[0] += 1
+        if rec[0] >= getattr(self.p.fire.blind_shots, kind, self.p.fire.blind_shots.gun):
+            rec[0] = 0
+            rec[1] = self.t + self.p.fire.blind_pause_s
+
+    def record_hit(self, target: int) -> None:
+        for (tid, _kind), rec in self._blind.items():
+            if tid == target:
+                rec[0] = 0
+                rec[1] = -1000000000.0
+
+    def blind_paused(self, target: int, kind: str) -> bool:
+        rec = self._blind.get((target, kind))
+        return bool(rec and self.t < rec[1])
