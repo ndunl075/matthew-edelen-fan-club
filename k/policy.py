@@ -1,4 +1,5 @@
 from __future__ import annotations
+import dataclasses
 import math
 import sys
 import time
@@ -6,6 +7,7 @@ import traceback
 from dataclasses import dataclass, field
 from . import aim as aimmod
 from . import loot as lootmod
+from . import skirmish as skirm
 from . import zone as zonemod
 from .derive import Band, Derived
 from .fire import Gunnery
@@ -87,14 +89,24 @@ class Bot:
         self._safe: tuple | None = None
         self._reach_cache: dict = {}
         self._loot_last: tuple | None = None
+        self._losing_until = -1000000000.0
+        self._last_target: tuple | None = None
+        self._strafe_side = 1.0
+        self._strafe_until = -1000000000.0
+        self._last_heading: tuple | None = None
+        self._engage_note = ''
+        self._hit_cache: tuple | None = None
         self.mem.set_sight(self.nav.has_los, getattr(self.nav, 'real', True))
 
     def _apply_profile(self, name: str) -> None:
         self.p.revert()
-        prof = getattr(self.p.profiles, name)
+        prof = getattr(self.p.profiles, self.profile_for(name))
         self.p.overlay(prof.set.as_dict())
         self.prof = prof
-        self.profile_name = name
+        self.profile_name = self.profile_for(name)
+
+    def profile_for(self, mode: str) -> str:
+        return str(self.p.practice_profile) if mode == 'practice' else mode
 
     def act(self, obs: dict) -> dict:
         self._t0 = time.perf_counter()
@@ -149,9 +161,9 @@ class Bot:
         self.mem.update(obs)
         self.book.update(obs, self.mem)
         name = self.detect.update(obs, self.mem, self.book)
-        if name != self.profile_name:
+        if self.profile_for(name) != self.profile_name:
             self._apply_profile(name)
-        self.assess.allow_props = self.farming_allowed(self.mem.t)
+        self.assess.allow_props = self.farming_allowed(self.mem.t, obs['self']['hp'] / max(obs['self']['max_hp'], 1.0))
         self.gun.observe(obs['self']['weapons'])
         v = self.assess.build(obs)
         self.view = v
@@ -211,14 +223,23 @@ class Bot:
     def in_opening(self, t: float) -> bool:
         return t <= self.prof.opening_s
 
-    def farming_allowed(self, t: float) -> bool:
+    def unseen_s(self, t: float | None=None) -> float:
+        last = max((tr.last_seen for tr in self.mem.tracks.values() if tr.kind == 'mech'), default=-1000000000.0)
+        return (self.mem.t if t is None else t) - last
+
+    def farming_allowed(self, t: float, hp_frac: float=1.0) -> bool:
         prof = self.prof
+        if prof.skirmish:
+            q = self.p.skirmish
+            return hp_frac > q.farm_hp_frac and self.unseen_s(t) >= q.farm_unseen_s
         if t <= prof.farm_until_s:
             return True
         return prof.farm_idle_s > 0 and t - self.mem.last_contact_t >= prof.farm_idle_s
 
     def choose_mode(self, v: View) -> Mode:
         prof = self.prof
+        if prof.skirmish:
+            return self.choose_mode_skirmish(v)
         if v.zone.urgent:
             return Mode('zone', goal=v.zone.goal)
         dodge = self.dodge_plan(v)
@@ -276,6 +297,159 @@ class Bot:
             if spot is not None:
                 return Mode('wait', goal=spot)
         return Mode('reposition')
+
+    def choose_mode_skirmish(self, v: View) -> Mode:
+        prof = self.prof
+        if v.zone.urgent:
+            return Mode('zone', goal=v.zone.goal)
+        dodge = self.dodge_plan(v)
+        if dodge is not None:
+            return dodge
+        target = self.skirm_target(v)
+        if self.skirm_retreat(v, target):
+            return Mode('retreat', target, note='losing')
+        if target is not None:
+            self._fight_id = target.id
+            self._last_target = (target.id, v.t)
+            return Mode('fight', target, note=self._engage_note)
+        self._fight_id = None
+        goal = self.drop_goal(v)
+        if goal is not None:
+            return Mode('drop', goal=goal)
+        if prof.scavenge_first and self.mem.t - self.mem.last_kill_t <= self.p.loot.scavenge_window_s:
+            cube = self.cube_goal(v)
+            if cube is not None:
+                return Mode('loot', goal=cube, note="dead bot's cubes")
+        if self.should_recover(v):
+            return Mode('recover')
+        goal = self.sticky_loot_goal(v)
+        if goal is not None:
+            return Mode('loot', goal=goal)
+        farm = self.farm_target(v)
+        if farm is not None:
+            return Mode('farm', farm)
+        if prof.hunt and v.hp_frac >= self.p.recover.hp_frac:
+            return Mode('hunt', goal=self.hunt_goal(v))
+        return Mode('reposition')
+
+    def hit_by(self, v: View) -> dict:
+        if self._hit_cache is None or self._hit_cache[0] != v.t:
+            self._hit_cache = (v.t, self.mem.damage_by(self.p.skirmish.engage_hit_s))
+        return self._hit_cache[1]
+
+    def skirm_candidates(self, v: View) -> list:
+        q = self.p.skirmish
+        cap = self.dv.view_cap(v.stats)
+        return [e for e in v.enemies if not e.prop and e.age <= q.track_age_s and (e.d3 <= cap)]
+
+    def skirm_target(self, v: View) -> Enemy | None:
+        q = self.p.skirmish
+        late = skirm.late_game(self.p, int(v.obs.get('alive', 16)), v.zone.next.r)
+        hit = self.hit_by(v)
+        keep_id = self._last_target[0] if self._last_target and v.t - self._last_target[1] <= q.target_keep_s else None
+        best, best_s, note = (None, 1e+18, '')
+        for e in self.skirm_candidates(v):
+            why = skirm.engage_reason(self.p, dist=e.d3, hit_age_ok=hit.get(e.id, 0.0) > 0.0, closing=e.closing, hp_frac=e.hp_frac, hp_known=e.tr.hp is not None, aimed=e.aimed, late=late)
+            if why is None:
+                continue
+            hp = e.tr.hp if e.tr.hp is not None else self.cfg['mech']['hp']
+            sc = skirm.target_score(self.p, dist=e.d3, hp=hp, hp_frac=e.hp_frac, keep=e.id == keep_id, hit_recent=self._hit_within(e, v, q.target_hit_s), closing=e.closing)
+            if sc < best_s:
+                best, best_s, note = (e, sc, why)
+        self._engage_note = note
+        return best
+
+    def _hit_within(self, e: Enemy, v: View, window: float) -> bool:
+        return any((d.by == e.id for d in self.mem.recent_damage(window)))
+
+    def skirm_retreat(self, v: View, target: Enemy | None) -> bool:
+        q = self.p.skirmish
+        near = [e for e in v.enemies if not e.prop and e.age <= q.retreat_age_s and (e.d3 <= q.retreat_near_m)]
+        ref = target if target is not None else near[0] if near else None
+        ref_hp = None if ref is None or ref.tr.hp is None else ref.hp_frac
+        if skirm.is_finishing(self.p, n_near=len(near), hp_frac=v.hp_frac, target_hp_frac=ref_hp):
+            self._losing_until = -1000000000.0
+            return False
+        if skirm.is_losing(self.p, n_near=len(near), hp_frac=v.hp_frac, target_hp_frac=ref_hp):
+            self._losing_until = v.t + q.retreat_hold_s
+        return v.t < self._losing_until
+
+    def skirm_hold(self, v: View, e: Enemy) -> tuple:
+        q = self.p.skirmish
+        if q.range_source == 'derived':
+            b = self.band_for(v, e)
+            return (b.hold, b.lo, b.hi)
+        hold = skirm.hold_range(self.p, has_laser=self.laser_slot(v) is not None, has_gun=v.slot_of('gun') is not None, has_lightning=v.slot_of('lightning') is not None, enemy_lightning='lightning' in e.holds, enemy_mortar='mortar' in e.holds, cap=self.dv.view_cap(v.stats))
+        return (hold, hold * (1.0 - q.range_band_frac), hold * (1.0 + q.range_band_frac))
+
+    def strafe_side(self, v: View) -> float:
+        q = self.p.skirmish
+        if v.t >= self._strafe_until:
+            if self.rng.random() < q.strafe_flip_prob:
+                self._strafe_side = -self._strafe_side
+            self._strafe_until = v.t + self.rng.uniform(q.strafe_min_s, q.strafe_max_s)
+        return self._strafe_side
+
+    def fight_cube(self, v: View, e: Enemy):
+        q = self.p.skirmish
+        reach = q.cube_low_hp_m if v.hp_frac < q.cube_low_hp_frac else q.cube_m
+        best, best_d = (None, reach)
+        for rec in self.mem.cubes.values():
+            d = dist2(rec.pos, v.pos)
+            if d < best_d and (not self.mem.is_blocked(rec.pos)) and (dist2(rec.pos, e.pos) > q.cube_enemy_m):
+                best, best_d = ((rec.pos[0], rec.pos[1]), d)
+        return best
+
+    def skirm_fight_legs(self, v: View, mode: Mode) -> tuple:
+        e = mode.target
+        hold, lo, hi = self.skirm_hold(v, e)
+        band = Band(lo, hi, hold, 1.0, '', True)
+        mode.band = band
+        charging = self.laser_slot(v) is not None and (self.laser_slot(v) or {}).get('charge', 0.0) > 0.0
+        hurt = self.mem.t - self.mem.last_hurt_t < self.p.kite.ground_s
+        kp = self.kiter.plan(v, e, band, charging=charging, hit_recently=hurt)
+        mode.kite = kp
+        mode.note = f'{mode.note} {e.d:.0f}/{hold:.0f}'
+        heading = None
+        if not self.over_budget():
+            eye_z = v.pos[2] + v.stats.get('eye_height', self.cfg['mech']['eye_height'])
+            others = [e2.center for e2 in v.enemies if e2 is not e and (not e2.prop) and e2.fresh and (e2.d3 <= self.dv.view_cap(v.stats))]
+            circle = self.safe_circle(v)
+            m = self.p.zone.margin_m
+
+            def sees(a, b):
+                pa = (a[0], a[1], eye_z)
+                pb = b if len(b) > 2 else (b[0], b[1], v.pos[2] + self.cfg['mech']['height'] * 0.5)
+                return self.nav.has_los(pa, pb)
+            heading = skirm.pick_heading(self.p, pos=v.pos, target=(e.pos[0], e.pos[1]), hold=hold, side=self.strafe_side(v), prev=self._last_heading, inside=lambda x, y: circle.contains((x, y), m), clear=self.nav.step_clear, sees=lambda p, t: sees(p, t), others=others, cube=self.fight_cube(v, e))
+        if heading is None:
+            heading = kp.direction
+        self._last_heading = heading
+        d = self.never_still(v, self.keep_inside(v, heading), e.pos)
+        speed = 1.0
+        boost = kp.boost and e.d < lo
+        return self.go_dir(v, d, speed, boost, ground=True)
+
+    def retreat_legs(self, v: View, mode: Mode) -> tuple:
+        q = self.p.skirmish
+        threats = [e for e in v.enemies if not e.prop and e.age <= q.retreat_age_s and (e.d3 <= q.retreat_near_m)]
+        boost = v.energy_frac >= q.retreat_boost_energy_frac
+        pt = self.cover_point(v, threats) if threats else None
+        circle = self.safe_circle(v)
+        if pt is not None and circle.contains(pt, self.p.zone.margin_m):
+            mode.goal = pt
+            mode.note += ' cover'
+            self._stalled(v, pt)
+            return self.go(v, pt, 1.0, boost, ground=True)
+        if q.roof_escape:
+            roof = self.roof_pick(v)
+            if roof is not None and dist2(roof, v.pos) <= q.retreat_roof_m:
+                mode.goal = roof
+                mode.note += ' roof'
+                self._stalled(v, roof)
+                return self.go(v, roof, 1.0, boost)
+        mode.note += ' run'
+        return self.disengage_legs(v)
 
     def dodge_plan(self, v: View) -> Mode | None:
         q = self.p.dodge
@@ -442,6 +616,8 @@ class Bot:
     def drop_goal(self, v: View) -> tuple | None:
         q = self.p.drop
         me_id = v.me['id']
+        if self.prof.skirmish and self.unseen_s() < self.p.skirmish.drop_unseen_s:
+            return None
         best, best_d = (None, 1e+18)
         clear = self.safe_range(v) * self.prof.clear_mult
         for d in v.obs.get('drops', []):
@@ -484,6 +660,8 @@ class Bot:
         cube_r = v.walk * q.cube_trip_s
         if self.in_opening(v.t) and prof.opening_laser:
             weapon_r = max(weapon_r, v.walk * prof.opening_s * q.opening_walk_frac)
+            if prof.skirmish:
+                weapon_r = self.p.skirmish.opening_loot_m
         if self.mem.t - self.mem.last_kill_t <= q.scavenge_window_s:
             cube_r = max(cube_r, v.walk * q.scavenge_trip_s)
         free = self.dv.jump_only_climb_m(v.stats)
@@ -501,7 +679,7 @@ class Bot:
             if budget[0] <= 0:
                 return None
             budget[0] -= 1
-            pt = self.nav.high_ground(v.me, (pos[0], pos[1], circle_r), max_climb=reach_m)
+            pt = self.roof_point(self.nav.high_ground(v.me, (pos[0], pos[1], circle_r), max_climb=reach_m))
             pt = None if pt is None else (pt[0], pt[1])
             if len(self._reach_cache) >= 64:
                 self._reach_cache.clear()
@@ -544,7 +722,8 @@ class Bot:
         goal, goal_d = (None, 1e+18)
         pk = None
         if self.in_opening(v.t) and self.prof.opening_laser and (v.slot_of('laser') is None):
-            pk = lootmod.best_pickup(v.me, self.mem, self.p, v.laser_threat, pts, lim, only='laser')
+            llim = dataclasses.replace(lim, weapon_radius=max(lim.weapon_radius, self.p.skirmish.opening_laser_m)) if self.prof.skirmish else lim
+            pk = lootmod.best_pickup(v.me, self.mem, self.p, v.laser_threat, pts, llim, only='laser')
         if pk is None:
             pk = lootmod.best_pickup(v.me, self.mem, self.p, v.laser_threat, pts, lim)
         if pk is not None:
@@ -588,6 +767,16 @@ class Bot:
             return None
         return pt
 
+    @staticmethod
+    def roof_point(hg):
+        if hg is None:
+            return None
+        st = getattr(hg, 'stand', hg)
+        z = getattr(st, 'z', None)
+        if z is None and len(st) > 2:
+            z = st[2]
+        return (st[0], st[1]) if z is None else (st[0], st[1], z)
+
     def update_roof_state(self, v: View) -> None:
         q = self.p.roof
         grounded = bool(v.me.get('grounded', True))
@@ -605,7 +794,7 @@ class Bot:
         self._roof_t = v.t
         nxt = v.zone.next
         circle = (nxt.cx, nxt.cy, max(nxt.r - nxt.margin_for(self.p.zone.margin_m), 1.0))
-        pt = self.nav.high_ground(v.me, circle, max_climb=self.dv.climb_m(v.me['energy'], v.stats))
+        pt = self.roof_point(self.nav.high_ground(v.me, circle, max_climb=self.dv.climb_m(v.me['energy'], v.stats)))
         spot = None
         if pt is not None:
             tall = len(pt) < 3 or self._ground_z is None or pt[2] - self._ground_z >= self.prof.roof_min_height_m
@@ -664,13 +853,13 @@ class Bot:
         circle = (nxt.cx, nxt.cy, max(nxt.r - m, 1.0))
         pt = self.nav.pocket(v.me, circle)
         if pt is None:
-            pt = self.nav.high_ground(v.me, circle)
+            pt = self.roof_point(self.nav.high_ground(v.me, circle))
         self._wait_t = v.t
         self._wait_spot = None if pt is None or self.mem.is_blocked(pt) else (pt[0], pt[1])
         return self._wait_spot
 
     def aim_target(self, v: View, mode: Mode) -> Enemy | None:
-        if mode.target is not None and mode.name in ('fight', 'dodge', 'disengage', 'cover', 'farm'):
+        if mode.target is not None and mode.name in ('fight', 'dodge', 'disengage', 'cover', 'farm', 'retreat'):
             return mode.target
         if v.attackers:
             return v.attackers[0]
@@ -681,7 +870,10 @@ class Bot:
             return False
         if mode.name == 'cover':
             return target.engaged or self.prof.fight_start_any
-        return mode.name == 'fight' or target.engaged or (target.prop and (not v.attackers))
+        return mode.name in ('fight', 'retreat') or target.engaged or (target.prop and (not v.attackers))
+
+    def opening_quiet(self, v: View) -> bool:
+        return bool(self.prof.skirmish and self.in_opening(v.t))
 
     def quiet_speed(self, v: View) -> float:
         return clamp(self.cfg['sound']['step_speed'] * self.p.sound.quiet_frac / max(v.walk, 1e-06), self.p.sound.min_speed_frac, 1.0)
@@ -747,14 +939,16 @@ class Bot:
             self._stalled(v, goal)
             return self.go(v, goal, 1.0, v.zone.hurry)
         if name == 'dodge':
-            return self.go_dir(v, mode.direction, 1.0)
+            return self.go_dir(v, mode.direction, 1.0, bool(self.p.dodge.boost and mode.note == 'laser'))
+        if name == 'retreat':
+            return self.retreat_legs(v, mode)
         if name == 'cover':
             self._stalled(v, mode.goal)
             return self.go(v, mode.goal, 1.0, ground=True)
         if name == 'disengage':
             return self.disengage_legs(v)
         if name == 'fight':
-            return self.fight_legs(v, mode)
+            return self.skirm_fight_legs(v, mode) if self.prof.skirmish else self.fight_legs(v, mode)
         if name == 'drop':
             x, y, r = mode.goal
             if dist2((x, y), v.pos) <= r * self.p.drop.ring_frac:
@@ -766,14 +960,14 @@ class Bot:
             return self.recover_legs(v)
         if name == 'loot':
             self._stalled(v, mode.goal)
-            return self.go(v, mode.goal, self.p.loot.speed_frac, quiet=self.prof.quiet_loot)
+            return self.go(v, mode.goal, self.p.loot.speed_frac, quiet=self.prof.quiet_loot or self.opening_quiet(v))
         if name == 'farm':
             return self.farm_legs(v, mode.target)
         if name == 'roof':
             return self.roof_legs(v, mode)
         if name == 'hunt':
             self._stalled(v, mode.goal)
-            return self.go(v, mode.goal, 1.0)
+            return self.go(v, mode.goal, 1.0, quiet=self.opening_quiet(v))
         if name == 'wait':
             if dist2(mode.goal, v.pos) <= self.p.reposition.arrive_m:
                 self.nav_reset()
@@ -868,7 +1062,7 @@ class Bot:
             self.nav_reset()
             return ((0.0, 0.0), False, False)
         self._stalled(v, (prop.pos[0], prop.pos[1]))
-        return self.go(v, (prop.pos[0], prop.pos[1]), 1.0)
+        return self.go(v, (prop.pos[0], prop.pos[1]), 1.0, quiet=self.opening_quiet(v))
 
     def recover_legs(self, v: View) -> tuple:
         q = self.p.recover
@@ -973,7 +1167,7 @@ class Bot:
         if self._stalled(v, spot):
             self._spot = None
         chased = any((e.d3 <= q.hurry_range_m and e.fresh for e in v.enemies))
-        return self.go(v, spot, 1.0, quiet=self.prof.quiet and (not chased))
+        return self.go(v, spot, 1.0, quiet=self.prof.quiet and (not chased) or self.opening_quiet(v))
 
     def _debug(self, v: View, mode: Mode, target: Enemy | None) -> dict:
         d: dict = {'label': f"{mode.name}{(':' + mode.note if mode.note else '')} hp{v.hp_frac:.0%} {self.detect.label}"}

@@ -39,10 +39,18 @@ class UpgradePicker:
 
     def rank(self, upgrade_id: str, held: set) -> int:
         cat = self.cat.get(upgrade_id, 'rest')
-        if cat in WEAPONS and cat not in held:
+        weapon_missing = cat in WEAPONS and cat not in held
+        ids = list(self.p.upgrades.id_order)
+        if upgrade_id in ids and (not self._weapon_missing(upgrade_id, held)):
+            return ids.index(upgrade_id)
+        if weapon_missing:
             cat = 'rest'
         order = self.order
-        return order.index(cat) if cat in order else len(order)
+        return len(ids) + (order.index(cat) if cat in order else len(order))
+
+    def _weapon_missing(self, upgrade_id: str, held: set) -> bool:
+        cat = self.cat.get(upgrade_id, 'rest')
+        return cat in WEAPONS and cat not in held
 
     def choose(self, offer: dict, held: set) -> int:
         choices = offer.get('choices', [])

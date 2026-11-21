@@ -89,7 +89,7 @@ def plan(zone: dict, t: float, pos, walk_speed: float, phases: list, p: Params, 
     need = max(0.0, d_next - (nxt.r - nxt.margin_for(z.margin_m)))
     idx = phase_index(zone, phases)
     center_mode = idx >= len(phases) - int(z.center_phases) if idx >= 0 else nxt.r <= z.center_radius_m
-    travel = need / max(walk_speed * z.speed_frac, 1e-06)
+    travel = need * z.path_mult / max(walk_speed * z.speed_frac, 1e-06)
     far_from_center = d_next > max(z.center_hold_m, z.center_hold_frac * nxt.r)
     urgent = outside or (center_mode and far_from_center) or (exposure < math.inf and exposure - travel < z.buffer_s)
     hurry = outside or (exposure < math.inf and exposure - travel < z.hurry_s)
