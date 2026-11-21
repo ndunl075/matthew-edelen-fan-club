@@ -1,6 +1,10 @@
 from __future__ import annotations
 import math
 from dataclasses import dataclass
+try:
+    import numpy as np
+except ImportError:
+    np = None
 from .params import Params
 from .util import clamp, dist2, lerp
 MAX_MARGIN_FRAC = 0.5
@@ -44,8 +48,9 @@ def clamp_into(circle: Circle, p, margin: float) -> tuple[float, float]:
         return circle.c
     return (circle.cx + dx / d * limit, circle.cy + dy / d * limit)
 
-def exposure_time(zone: dict, t: float, pos, margin: float, step: float) -> float:
-    end = max(zone['shrink_end'], t)
+def exposure_time(zone: dict, t: float, pos, margin: float, step: float, duration: float=math.inf) -> float:
+    end = min(max(zone['shrink_end'], t), max(duration, t))
+    step = max(step, 0.05)
     tau = t
     while True:
         if not circle_at(zone, tau).contains(pos, margin):
@@ -74,12 +79,12 @@ class ZonePlan:
     now: Circle
     seconds_left: float
 
-def plan(zone: dict, t: float, pos, walk_speed: float, phases: list, p: Params, in_zone: bool=True) -> ZonePlan:
+def plan(zone: dict, t: float, pos, walk_speed: float, phases: list, p: Params, in_zone: bool=True, duration: float=math.inf) -> ZonePlan:
     z = p.zone
     now, nxt = (circle_at(zone, t), next_circle(zone))
     outside = not in_zone or dist2(pos, now.c) > now.r
     unsafe = not now.contains(pos, z.margin_m)
-    exposure = exposure_time(zone, t, pos, z.margin_m, z.sample_s)
+    exposure = exposure_time(zone, t, pos, z.margin_m, z.sample_s, duration)
     d_next = dist2(pos, nxt.c)
     need = max(0.0, d_next - (nxt.r - nxt.margin_for(z.margin_m)))
     idx = phase_index(zone, phases)
@@ -111,6 +116,15 @@ def pick_spot(nxt: Circle, pos, hazards: list, p: Params) -> tuple[float, float]
     for k in range(int(q.local_points)):
         a = 2.0 * math.pi * k / q.local_points
         cands.append(clamp_into(nxt, (pos[0] + math.cos(a) * q.local_step_m, pos[1] + math.sin(a) * q.local_step_m), m))
+    if np is not None and hazards:
+        cx = np.array([c[0] for c in cands])
+        cy = np.array([c[1] for c in cands])
+        hz = np.array(hazards, dtype=float)
+        d = np.hypot(cx[:, None] - hz[None, :, 0], cy[:, None] - hz[None, :, 1])
+        rad = np.maximum(hz[None, :, 3], 1e-09)
+        haz = np.where(d < rad, hz[None, :, 2] * (1.0 - d / rad), 0.0).sum(axis=1)
+        score = -q.w_travel * np.hypot(cx - pos[0], cy - pos[1]) / q.travel_unit_m - q.w_center * np.hypot(cx - nxt.cx, cy - nxt.cy) / max(nxt.r, 1.0) - q.w_hazard * haz
+        return clamp_into(nxt, cands[int(np.argmax(score))], m)
     best, best_score = (cands[0], -math.inf)
     for c in cands:
         score = -q.w_travel * dist2(c, pos) / q.travel_unit_m

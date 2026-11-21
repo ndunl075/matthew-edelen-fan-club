@@ -1,6 +1,7 @@
 from __future__ import annotations
 import math
 import sys
+import time
 import traceback
 from dataclasses import dataclass, field
 from . import aim as aimmod
@@ -12,7 +13,7 @@ from .nav import Nav, NullWorld
 from .params import Params, load_params
 from .threat import Assessor, Enemy, View
 from .upgrades import UpgradePicker
-from .util import clamp, dist2, rot2, unit2, wrap
+from .util import clamp, dist2, rot2, sane_config, sane_stats, unit2, wrap
 
 @dataclass
 class Mode:
@@ -28,6 +29,7 @@ class Bot:
     name = 'k2'
 
     def __init__(self, hello: dict, params: Params | None=None, world=None):
+        hello = {**hello, 'config': sane_config(hello.get('config'))}
         self.hello = hello
         self.cfg = hello['config']
         self.p = params or load_params()
@@ -54,10 +56,18 @@ class Bot:
         self._spot_t = -1000000000.0
         self._pick_offer = None
         self._pick_t = -1000000000.0
+        self._wd: tuple | None = None
+        self._detour: tuple | None = None
+        self._detour_until = -1000000000.0
+        self._t0 = 0.0
+        self._last_act: dict | None = None
 
     def act(self, obs: dict) -> dict:
+        self._t0 = time.perf_counter()
         try:
-            return self._act(obs)
+            act = self._act(obs)
+            self._last_act = act
+            return act
         except Exception:
             if self.strict:
                 raise
@@ -74,11 +84,26 @@ class Bot:
             act['pick'] = 0
         return act
 
+    def over_budget(self) -> bool:
+        return (time.perf_counter() - self._t0) * 1000.0 > self.p.budget.decision_ms
+
+    def _sane_obs(self, obs: dict) -> dict:
+        me = obs['self']
+        weapons = [dict(w, stats=sane_stats(w.get('stats'), self.cfg['weapons'].get(w.get('kind')))) if w else w for w in me.get('weapons', [])]
+        return {**obs, 'self': {**me, 'stats': sane_stats(me.get('stats'), self.cfg['mech']), 'weapons': weapons}}
+
     def _act(self, obs: dict) -> dict:
+        obs = self._sane_obs(obs)
         self.mem.update(obs)
         self.gun.observe(obs['self']['weapons'])
         v = self.assess.build(obs)
         self.view = v
+        if self._last_act is not None and self.over_budget():
+            act = {k: val for k, val in self._last_act.items() if k not in ('take', 'drop', 'pick', 'debug')}
+            act['tick'] = obs['tick']
+            if obs.get('offer'):
+                act['pick'] = self.picker.choose(obs['offer'], v.held())
+            return act
         mode = self.choose_mode(v)
         self.last = mode
         self.mode = mode.name
@@ -237,6 +262,8 @@ class Bot:
                 continue
             pos = d['pos']
             dist = dist2(pos, v.pos)
+            if self.mem.is_blocked(pos):
+                continue
             if d['lands_in'] > dist / (v.walk * q.speed_frac) + q.lead_s:
                 continue
             if not (v.zone.next.contains(pos, self.p.zone.margin_m) and v.zone.now.contains(pos, self.p.zone.margin_m)):
@@ -330,6 +357,20 @@ class Bot:
         mixed = unit2(d[0] + inward[0] * self.p.zone.inward_mix, d[1] + inward[1] * self.p.zone.inward_mix)
         return mixed if mixed != (0.0, 0.0) else inward
 
+    def never_still(self, v: View, d: tuple, ref=None) -> tuple:
+        if d != (0.0, 0.0):
+            return d
+        if ref is not None:
+            u = unit2(ref[0] - v.pos[0], ref[1] - v.pos[1])
+            if u != (0.0, 0.0):
+                return rot2(u, self._dodge_side * math.pi / 2.0)
+        c = self.safe_circle(v)
+        u = unit2(c.cx - v.pos[0], c.cy - v.pos[1])
+        if u != (0.0, 0.0):
+            return u
+        a = self.rng.uniform(0.0, 2.0 * math.pi)
+        return (math.cos(a), math.sin(a))
+
     def go(self, v: View, goal, speed: float, boost: bool=False) -> tuple:
         st = self.nav.steer(v.me, goal, speed, v.t)
         energy_ok = v.energy_frac >= self.p.nav.boost_min_energy_frac
@@ -343,7 +384,9 @@ class Bot:
     def legs(self, v: View, mode: Mode) -> tuple:
         name = mode.name
         if name == 'zone':
-            return self.go(v, mode.goal, 1.0, v.zone.hurry)
+            goal = self._zone_goal(v, mode.goal)
+            self._stalled(v, goal)
+            return self.go(v, goal, 1.0, v.zone.hurry)
         if name == 'dodge':
             return self.go_dir(v, mode.direction, 1.0)
         if name == 'disengage':
@@ -355,10 +398,12 @@ class Bot:
             if dist2((x, y), v.pos) <= r * self.p.drop.ring_frac:
                 self.nav.reset()
                 return ((0.0, 0.0), False, False)
+            self._stalled(v, (x, y))
             return self.go(v, (x, y), 1.0)
         if name == 'recover':
             return self.recover_legs(v)
         if name == 'loot':
+            self._stalled(v, mode.goal)
             return self.go(v, mode.goal, self.p.loot.speed_frac)
         return self.reposition_legs(v)
 
@@ -378,6 +423,8 @@ class Bot:
         if v.attackers:
             d = self.toward_cover(d, v.pos, v.attackers[0].pos)
         d = self.keep_inside(v, d) if d != (0.0, 0.0) else d
+        ref = (v.attackers or v.enemies or [None])[0]
+        d = self.never_still(v, d, None if ref is None else ref.pos)
         goal = (v.pos[0] + d[0] * q.flee_m, v.pos[1] + d[1] * q.flee_m)
         goal = zonemod.clamp_into(self.safe_circle(v), goal, self.p.zone.margin_m)
         near = min((e.d3 for e in v.attackers), default=1000000000.0)
@@ -389,14 +436,14 @@ class Bot:
         lo, hi = band
         mid = 0.5 * (lo + hi)
         fw = clamp((e.d - mid) / max(0.5 * (hi - lo), 1.0), -1.0, 1.0)
-        toward = unit2(e.pos[0] - v.pos[0], e.pos[1] - v.pos[1])
+        toward = self.never_still(v, unit2(e.pos[0] - v.pos[0], e.pos[1] - v.pos[1]))
         if v.t >= self._strafe_until:
             if self.rng.random() < q.strafe_flip_prob:
                 self._strafe = -self._strafe
             self._strafe_until = v.t + self.rng.uniform(q.strafe_min_s, q.strafe_max_s)
         side = rot2(toward, self._strafe * math.pi / 2.0)
         d = unit2(toward[0] * fw * q.radial_w + side[0] * q.strafe_w, toward[1] * fw * q.radial_w + side[1] * q.strafe_w)
-        d = self.keep_inside(v, d)
+        d = self.never_still(v, self.keep_inside(v, d))
         speed = 1.0
         if e.unaware and (not e.engaged) and (e.d > q.sneak_range_m):
             speed = self.quiet_speed(v)
@@ -425,6 +472,8 @@ class Bot:
             self.nav.reset()
             return ((0.0, 0.0), False, False)
         goal = self._spot_for(v, self.p.reposition.hazard_mult_recover)
+        if self._stalled(v, goal):
+            self._spot = None
         panic = dmin < q.panic_m
         return self.go(v, goal, 1.0 if panic else self.quiet_speed(v))
 
@@ -440,13 +489,50 @@ class Bot:
                 out.append((s.ex, s.ey, w, q.sound_radius_m))
         for d in v.drones:
             out.append((d.pos[0], d.pos[1], q.drone_weight * mult, q.drone_radius_m))
+        for g in self.mem.goal_block:
+            if g[2] >= v.t:
+                out.append((g[0], g[1], q.enemy_weight, self.p.stuck.block_radius_m * 3.0))
         return out
+
+    def _stalled(self, v: View, goal) -> bool:
+        q = self.p.stuck
+        d = dist2(goal, v.pos)
+        wd = self._wd
+        self._wd = (goal, d, v.t, v.t) if wd is None else wd[:3] + (v.t,)
+        if wd is None or v.t - wd[3] > q.reset_gap_s or dist2(wd[0], goal) > q.goal_jump_m or (d <= q.min_dist_m):
+            self._wd = (goal, d, v.t, v.t)
+            return False
+        if d < wd[1] - q.shrink_m:
+            self._wd = (wd[0], d, v.t, v.t)
+            return False
+        if v.t - wd[2] < q.give_up_s:
+            return False
+        self.mem.block_goal(goal, q.block_s)
+        self._wd = None
+        return True
+
+    def _zone_goal(self, v: View, goal: tuple) -> tuple:
+        if not self.mem.is_blocked(goal):
+            self._detour = None
+            return goal
+        if self._detour is None or v.t > self._detour_until or self.mem.is_blocked(self._detour):
+            c = v.zone.next
+            lim = max(0.0, c.r - c.margin_for(self.p.zone.margin_m))
+            for _ in range(8):
+                a, r = (self.rng.uniform(0.0, 2.0 * math.pi), lim * 0.8 * math.sqrt(self.rng.random()))
+                self._detour = (c.cx + r * math.cos(a), c.cy + r * math.sin(a))
+                if not self.mem.is_blocked(self._detour):
+                    break
+            self._detour_until = v.t + self.p.stuck.detour_s
+        return self._detour
 
     def _spot_for(self, v: View, mult: float=1.0) -> tuple:
         q = self.p.reposition
-        haz = self.hazards(v, mult)
         nxt = v.zone.next
         spot = self._spot
+        if spot is not None and nxt.contains(spot, self.p.zone.margin_m) and (v.t - self._spot_t < q.min_replan_s or self.over_budget()):
+            return spot
+        haz = self.hazards(v, mult)
         stale = spot is None or v.t - self._spot_t > q.replan_s or (not nxt.contains(spot, self.p.zone.margin_m)) or (zonemod.hazard_at(haz, spot) > q.abort_hazard) or (zonemod.hazard_at(haz, v.pos) > q.leave_hazard)
         if stale:
             self._spot = zonemod.pick_spot(nxt, v.pos, haz, self.p)
@@ -459,6 +545,8 @@ class Bot:
         if dist2(spot, v.pos) <= q.arrive_m:
             self.nav.reset()
             return ((0.0, 0.0), False, False)
+        if self._stalled(v, spot):
+            self._spot = None
         chased = any((e.d3 <= q.hurry_range_m and e.fresh for e in v.enemies))
         return self.go(v, spot, 1.0 if chased else self.quiet_speed(v))
 

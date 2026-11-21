@@ -4,7 +4,8 @@ import random
 from collections import deque
 from dataclasses import dataclass, field
 from .params import Params
-from .util import dist2
+from .util import angdiff, dist2
+_DIST_RANK = {'near': 0, 'mid': 1, 'far': 2}
 FIRST_CRATE_ID = 1000
 
 @dataclass
@@ -67,16 +68,30 @@ class BeamRec:
     kind: str
     path: list
 
+def _nearest(items: list, cap: int, x: float, y: float) -> list:
+    if len(items) <= cap:
+        return items
+    return sorted(items, key=lambda it: math.hypot(it['pos'][0] - x, it['pos'][1] - y))[:cap]
+
+def _cap(store: dict, cap: int, x: float, y: float) -> None:
+    if len(store) <= cap:
+        return
+    keep = sorted(store.values(), key=lambda r: (-r.last_seen, dist2(r.pos, (x, y))))[:cap]
+    kept = {id(r) for r in keep}
+    for rid in [i for i, r in store.items() if id(r) not in kept]:
+        del store[rid]
+
 class Memory:
 
     def __init__(self, hello: dict, params: Params):
         self.p = params
         self.cfg = hello['config']
-        self.slot = int(hello['slot'])
+        self.slot = int(hello.get('slot', 0))
         self.rng = random.Random(int(hello.get('seed', 0)))
         self.t = 0.0
         self.tick = 0
         self.pos = [0.0, 0.0, 0.0]
+        self.aim = [0.0, 0.0]
         self.tracks: dict[int, Track] = {}
         self.damage_log: deque[DamageRec] = deque(maxlen=64)
         self.hit_log: deque[tuple] = deque(maxlen=64)
@@ -89,6 +104,7 @@ class Memory:
         self.beams: list[BeamRec] = []
         self.take_block: dict[int, float] = {}
         self.kind_block: dict[str, float] = {}
+        self.goal_block: list[tuple] = []
         self.last_combat_t = -1000000000.0
         self.last_hurt_t = -1000000000.0
         self.shorted_until = -1000000000.0
@@ -99,6 +115,7 @@ class Memory:
         self.t = float(obs['t'])
         self.tick = int(obs['tick'])
         self.pos = list(obs['self']['pos'])
+        self.aim = list(obs['self'].get('aim', self.aim))
         self._events(obs.get('events', []))
         self._mechs(obs.get('mechs', []))
         self._sounds(obs.get('sounds', []))
@@ -164,27 +181,42 @@ class Memory:
     def _sounds(self, sounds: list) -> None:
         dists = self.p.memory.sound_dist_m
         x, y = (self.pos[0], self.pos[1])
+        cap = int(self.p.memory.max_sounds)
+        if len(sounds) > cap:
+            sounds = sorted(sounds, key=lambda s: (_DIST_RANK.get(s.get('dist'), 1), s.get('age', 0.0)))[:cap]
         for s in sounds:
             d = getattr(dists, s['dist'], dists.mid)
             b = float(s['bearing'])
             self.sounds.append(SoundRec(self.t - float(s.get('age', 0.0)), s['kind'], b, s['dist'], x, y, x + d * math.cos(b), y + d * math.sin(b)))
 
+    def _looked_at(self, pos) -> bool:
+        p, vis = (self.p.memory, self.cfg['vision'])
+        d = dist2(pos, self.pos)
+        if d > min(p.look_forget_m, float(vis['range'])):
+            return False
+        half = math.radians(float(vis['fov_deg'])) / 2.0 - math.radians(p.look_margin_deg)
+        bearing = math.atan2(pos[1] - self.pos[1], pos[0] - self.pos[0])
+        return abs(angdiff(bearing, self.aim[0])) <= half
+
     def _items(self, obs: dict) -> None:
         t = self.t
         x, y = (self.pos[0], self.pos[1])
+        m = self.p.memory
         listed = set()
-        for pk in obs.get('pickups', []):
+        for pk in _nearest(obs.get('pickups', []), int(m.max_pickups), x, y):
             listed.add(int(pk['id']))
             self.pickups[int(pk['id'])] = PickupRec(int(pk['id']), pk['kind'], list(pk['pos']), t)
-        for pid in [i for i, r in self.pickups.items() if i not in listed and dist2(r.pos, (x, y)) < self.p.memory.pickup_forget_m and (r.last_seen < t)]:
+        for pid in [i for i, r in self.pickups.items() if i not in listed and r.last_seen < t and (dist2(r.pos, (x, y)) < m.pickup_forget_m or self._looked_at(r.pos))]:
             del self.pickups[pid]
-        for store, key, forget in ((self.cubes, 'cubes', self.p.memory.cube_forget_m), (self.crates, 'crates', self.p.memory.crate_forget_m)):
+        _cap(self.pickups, int(m.max_pickups), x, y)
+        for store, key, forget, cap in ((self.cubes, 'cubes', m.cube_forget_m, int(m.max_cubes)), (self.crates, 'crates', m.crate_forget_m, int(m.max_crates))):
             seen = set()
-            for it in obs.get(key, []):
+            for it in _nearest(obs.get(key, []), cap, x, y):
                 seen.add(int(it['id']))
                 store[int(it['id'])] = ItemRec(int(it['id']), list(it['pos']), it.get('hp'), t)
-            for iid in [i for i, r in store.items() if i not in seen and dist2(r.pos, (x, y)) < forget and (r.last_seen < t)]:
+            for iid in [i for i, r in store.items() if i not in seen and r.last_seen < t and (dist2(r.pos, (x, y)) < forget or self._looked_at(r.pos))]:
                 del store[iid]
+            _cap(store, cap, x, y)
 
     def _beams(self, beams: list) -> None:
         for b in beams:
@@ -197,6 +229,14 @@ class Memory:
     def _prune(self) -> None:
         t, p = (self.t, self.p.memory)
         self.sounds = [s for s in self.sounds if t - s.t <= p.sound_keep_s]
+        cap = int(p.max_sounds)
+        if len(self.sounds) > cap:
+            newest = sorted(self.sounds, key=lambda s: -s.t)
+            keep, rest = (newest[:cap // 2], newest[cap // 2:])
+            x, y = (self.pos[0], self.pos[1])
+            rest.sort(key=lambda s: math.hypot(s.ex - x, s.ey - y))
+            keep += rest[:cap - len(keep)]
+            self.sounds = sorted(keep, key=lambda s: s.t)
         self.beams = [b for b in self.beams if t - b.t <= p.beam_keep_s]
         for tid in [i for i, tr in self.tracks.items() if t - tr.last_seen > p.track_keep_s]:
             del self.tracks[tid]
@@ -204,6 +244,14 @@ class Memory:
             del self.take_block[pid]
         for k in [k for k, until in self.kind_block.items() if until < t]:
             del self.kind_block[k]
+        self.goal_block = [g for g in self.goal_block if g[2] >= t][-16:]
+
+    def block_goal(self, pos, seconds: float) -> None:
+        self.goal_block.append((pos[0], pos[1], self.t + seconds))
+
+    def is_blocked(self, pos) -> bool:
+        r = self.p.stuck.block_radius_m
+        return any((g[2] >= self.t and math.hypot(pos[0] - g[0], pos[1] - g[1]) <= r for g in self.goal_block))
 
     def est_pos(self, tr: Track, t: float | None=None) -> list:
         t = self.t if t is None else t

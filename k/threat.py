@@ -102,7 +102,7 @@ class Assessor:
         st = me['stats']
         pos = me['pos']
         height = st.get('height', self.cfg['mech']['height'])
-        v = View(obs=obs, t=t, me=me, pos=pos, vel=me['vel'], center=(pos[0], pos[1], pos[2] + height / 2.0), aim=me['aim'], stats=st, hp_frac=me['hp'] / max(me['max_hp'], 1.0), energy_frac=me['energy'] / max(me['max_energy'], 1.0), weapons=me['weapons'], walk=st.get('walk_speed', self.cfg['mech']['walk_speed']), radius=st.get('radius', self.cfg['mech']['radius']), zone=zonemod.plan(obs['zone'], t, pos, st.get('walk_speed', self.cfg['mech']['walk_speed']), self.phases, self.p, bool(me.get('in_zone', True))))
+        v = View(obs=obs, t=t, me=me, pos=pos, vel=me['vel'], center=(pos[0], pos[1], pos[2] + height / 2.0), aim=me['aim'], stats=st, hp_frac=me['hp'] / max(me['max_hp'], 1.0), energy_frac=me['energy'] / max(me['max_energy'], 1.0), weapons=me['weapons'], walk=st.get('walk_speed', self.cfg['mech']['walk_speed']), radius=st.get('radius', self.cfg['mech']['radius']), zone=zonemod.plan(obs['zone'], t, pos, st.get('walk_speed', self.cfg['mech']['walk_speed']), self.phases, self.p, bool(me.get('in_zone', True)), float(self.cfg['match']['duration_s'])))
         v.laser_threat = self.mem.laser_threat()
         dps_me = self.my_dps(v)
         for tr in self.mem.mechs(self.p.threat.max_age_s):

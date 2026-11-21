@@ -48,6 +48,7 @@ def gun_solution(pos, muzzle_h: float, offset: float, target, target_vel, speed:
 def mortar_pitch(dist: float, dz: float, speed: float, gravity: float, high: bool=False) -> float | None:
     if dist < 1e-06:
         return math.pi / 2.0 if high else None
+    speed, gravity = (max(speed, 1e-06), max(gravity, 1e-06))
     k = 2.0 * gravity / (speed * speed)
     disc = 1.0 - k * (dz + gravity * dist * dist / (2.0 * speed * speed))
     if disc < 0.0:
@@ -70,14 +71,14 @@ def mortar_solution(pos, tube_h: float, offset: float, target, target_vel, speed
         if new_pitch is None:
             return None
         pitch = new_pitch
-        t = dist / (speed * math.cos(pitch))
+        t = dist / max(speed * math.cos(pitch), 1e-06)
         point = (target[0] + target_vel[0] * t, target[1] + target_vel[1] * t, target[2] + target_vel[2] * t)
     if t > ttl or not pitch_lo <= pitch <= pitch_hi:
         return None
     return Solution(yaw, pitch, t, point)
 
 def mortar_impact(pos, vel, gravity: float, plane_z: float) -> tuple[float, float, float] | None:
-    a, b, c = (-0.5 * gravity, vel[2], pos[2] - plane_z)
+    a, b, c = (-0.5 * max(gravity, 1e-06), vel[2], pos[2] - plane_z)
     disc = b * b - 4.0 * a * c
     if disc < 0.0:
         return None

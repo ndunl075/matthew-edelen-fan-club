@@ -1,6 +1,9 @@
 from __future__ import annotations
+import copy
 import math
+from .kitdefaults import DEFAULT_CONFIG
 TAU = 2.0 * math.pi
+POSITIVE = frozenset({'tick_hz', 'decide_every', 'duration_s', 'gravity', 'walk_speed', 'boost_speed', 'speed', 'cooldown', 'range', 'turn_rate', 'pitch_rate', 'mag', 'charge', 'ttl', 'hp', 'radius', 'height', 'eye_height', 'muzzle_height', 'fov_deg', 'near_range', 'step_speed', 'splash_radius', 'cone_deg', 'pickup_radius', 'energy'})
 
 def wrap(a: float) -> float:
     a = (a + math.pi) % TAU - math.pi
@@ -49,3 +52,34 @@ def aim_to(origin, target) -> tuple[float, float]:
 
 def aim_error(a, b) -> float:
     return angle_between(dir3(a[0], a[1]), dir3(b[0], b[1]))
+
+def num(d, key: str, default: float, positive: bool | None=None) -> float:
+    try:
+        v = d[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or (not math.isfinite(v)):
+        return default
+    if (key in POSITIVE if positive is None else positive) and v <= 0:
+        return default
+    return v
+
+def fill_numbers(have, defaults: dict) -> dict:
+    out = dict(have) if isinstance(have, dict) else {}
+    for key, dv in defaults.items():
+        if isinstance(dv, dict):
+            out[key] = fill_numbers(out.get(key), dv)
+        elif isinstance(dv, bool):
+            out[key] = out[key] if isinstance(out.get(key), bool) else dv
+        elif isinstance(dv, (int, float)):
+            out[key] = num(out, key, dv)
+        elif not isinstance(out.get(key), type(dv)):
+            out[key] = copy.deepcopy(dv)
+    return out
+
+def sane_config(cfg) -> dict:
+    return fill_numbers(cfg, DEFAULT_CONFIG)
+
+def sane_stats(stats, defaults) -> dict:
+    base = {k: v for k, v in (defaults or {}).items() if isinstance(v, (int, float)) and (not isinstance(v, bool))}
+    return fill_numbers(stats, base)

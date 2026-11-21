@@ -44,7 +44,7 @@ def best_pickup(me: dict, mem: Memory, p: Params, laser_threat: bool, enemy_poin
     pos = me['pos']
     best, best_cost = (None, 1e+18)
     for rec in mem.pickups.values():
-        if mem.take_block.get(rec.id, -1000000000.0) > mem.t or mem.kind_block.get(rec.kind, -1000000000.0) > mem.t:
+        if mem.take_block.get(rec.id, -1000000000.0) > mem.t or mem.kind_block.get(rec.kind, -1000000000.0) > mem.t or mem.is_blocked(rec.pos):
             continue
         want, _ = take_plan(rec.kind, me['weapons'], p, laser_threat)
         d = dist2(rec.pos, pos)
@@ -63,7 +63,7 @@ def best_cube(me: dict, mem: Memory, p: Params, enemy_points: list):
     best, best_d = (None, 1e+18)
     for rec in mem.cubes.values():
         d = dist2(rec.pos, pos)
-        if d > q.cube_radius_m or abs(rec.pos[2] - pos[2]) > q.max_climb_m:
+        if d > q.cube_radius_m or abs(rec.pos[2] - pos[2]) > q.max_climb_m or mem.is_blocked(rec.pos):
             continue
         if any((dist2(rec.pos, e) < q.enemy_clear_m for e in enemy_points)):
             continue
