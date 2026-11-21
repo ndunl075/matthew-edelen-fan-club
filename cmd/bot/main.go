@@ -82,7 +82,7 @@ func main() {
 					fmt.Fprintf(os.Stderr, "map loaded in %d ms: mech nx=%d ny=%d nav_nx=%d nav_ny=%d\n", time.Since(mapStart).Milliseconds(), w.NX, w.NY, w.NNX, w.NNY)
 				}
 				brain = mech.NewBrain(&h, w)
-				send(map[string]string{"type": "ready", "name": "Kanyaraasi"})
+				send(map[string]string{"type": "ready", "name": "k3"})
 			case "obs":
 				latest = raw
 			case "end":
