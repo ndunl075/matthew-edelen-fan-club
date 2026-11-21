@@ -1,22 +1,45 @@
 {
-  "weapon_rank": {"mortar": 3, "lightning": 2, "gun": 1, "laser": 0},
-  "never_take": ["laser"],
-  "upgrade_prefs": ["gun_rate", "gun_damage", "mortar_reload", "lightning_efficiency",
-                    "mortar_velocity", "gun_velocity", "gun_mag", "mortar_splash",
-                    "lightning_chain", "servos", "gyros", "jets"],
-  "upgrade_avoid": ["armor", "plating", "sensors", "nanites"],
-  "chase_boost_dist": 35.0,
-  "min_energy_boost": 18.0,
-  "strafe": 0.15,
-  "mortar_min_dist": 12.0,
-  "mortar_max_dist": 215.0,
-  "lightning_range": 42.0,
-  "fire_tol_rad": 0.06,
-  "pickup_chase": 70.0,
-  "pickup_ignore_if_enemy": 30.0,
-  "cube_chase": 40.0,
-  "drop_chase": 400.0,
-  "early_center_s": 150.0,
-  "zone_margin": 25.0,
-  "npc_target_range": 60.0
+  "weapon_rank": {
+    "mortar": 4,
+    "lightning": 2,
+    "gun": 1,
+    "laser": 0
+  },
+  "never_take": [
+    "laser"
+  ],
+  "upgrade_prefs": [
+    "gun_rate",
+    "gun_damage",
+    "mortar_reload",
+    "lightning_efficiency",
+    "mortar_velocity",
+    "gun_velocity",
+    "gun_mag",
+    "mortar_splash",
+    "lightning_chain",
+    "servos",
+    "gyros",
+    "jets"
+  ],
+  "upgrade_avoid": [
+    "armor",
+    "plating",
+    "sensors",
+    "nanites"
+  ],
+  "chase_boost_dist": 29.378,
+  "min_energy_boost": 21.325,
+  "strafe": 0.17,
+  "mortar_min_dist": 13.816,
+  "mortar_max_dist": 179.765,
+  "lightning_range": 45.023,
+  "fire_tol_rad": 0.059,
+  "pickup_chase": 59.626,
+  "pickup_ignore_if_enemy": 25.748,
+  "cube_chase": 34.594,
+  "drop_chase": 393.915,
+  "early_center_s": 170.036,
+  "zone_margin": 20.159,
+  "npc_target_range": 55.754
 }
