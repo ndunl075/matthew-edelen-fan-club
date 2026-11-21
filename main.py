@@ -1,14 +1,14 @@
-"""Mech Royale bot: aggressive kill-snowball.
+"""The league worker: aggressive tag-snowball.
 
-Team thesis: kills drop cubes, cubes give HP and damage, so the mech that gets the
-first few kills snowballs. Hunt the nearest visible mech from the first second and
+Team thesis: tags drop chips, chips give HP and damage, so the unit that gets the
+first few tags snowballs. Hunt the nearest visible unit from the first second and
 never stop chasing. Weights live in tuning.json so we can tweak without touching code.
 """
 import json
 import math
 import os
 
-import mechfight as mf
+import wire as mf
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -33,7 +33,7 @@ def unit(dx, dy):
 
 
 class Bot:
-    name = "snowball-v1"
+    name = "w1"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -50,7 +50,7 @@ class Bot:
     # ------------------------------------------------------------------ targeting
 
     def pick_target(self, obs):
-        """Nearest visible mech. Fall back to a nearby NPC drone (2 cubes each)."""
+        """Nearest visible unit. Fall back to a nearby NPC drone (2 chips each)."""
         me = obs["self"]["pos"]
         mechs = [m for m in obs["mechs"] if m["kind"] == "mech"]
         if mechs:
@@ -118,7 +118,7 @@ class Bot:
         return z["center"] if obs["t"] < self.tune["early_center_s"] else z["next_center"]
 
     def drop_goal(self, obs, me):
-        """Every supply drop gets contested (3 cubes, full HP). Take the closest one."""
+        """Every parcel gets contested (3 chips, full HP). Take the closest one."""
         drops = [d for d in obs["drops"] if dist2(d["pos"], me["pos"]) < self.tune["drop_chase"]]
         return min(drops, key=lambda d: dist2(d["pos"], me["pos"])) if drops else None
 
@@ -133,7 +133,7 @@ class Bot:
     # ------------------------------------------------------------------ loot and upgrades
 
     def want_weapon(self, me, kind):
-        """Rank-based weapon choice: mortar > lightning > gun, never the laser."""
+        """Rank-based weapon choice: lob > arc > pea, never the lance."""
         rank = self.tune["weapon_rank"]
         if kind in self.tune["never_take"] or rank.get(kind, 0) <= 0:
             return None  # not worth a slot
@@ -224,11 +224,11 @@ class Bot:
         if why == "drop" and gdist < 5:
             dx, dy = 0.0, 0.0  # sit in the ring and capture
         elif why == "hunt" and tdist < 12:
-            dx, dy = -dx * 0.3, -dy * 0.3  # too close for the mortar: back off a hair
+            dx, dy = -dx * 0.3, -dy * 0.3  # too close for the lob: back off a hair
         if why == "hunt" and tune["strafe"]:
             dx, dy = dx - dy * tune["strafe"], dy + dx * tune["strafe"]
         act["move"] = [dx, dy]
-        # boost and jet freely to close distance
+        # dash and hop freely to close distance
         far = gdist > tune["chase_boost_dist"]
         act["boost"] = bool((far or zone_danger or stuck) and me["energy"] > tune["min_energy_boost"])
         act["jump"] = bool(stuck and me["grounded"])
@@ -254,7 +254,7 @@ class Bot:
         return act
 
     def aim_and_fire(self, me, tgt, tdist, act):
-        """Mortar if it's ready and in range, otherwise lead the gun. Lightning when close."""
+        """Lob if it's ready and in range, otherwise lead the pea. Arc when close."""
         slots = {w["kind"]: (i, w) for i, w in enumerate(me["weapons"]) if w}
         tol = self.tune["fire_tol_rad"]
         aim = None
@@ -265,7 +265,7 @@ class Bot:
                 aim = m_aim
         if aim is None and "gun" in slots:
             aim = self.gun_aim(me, tgt, slots["gun"][1]["stats"])
-        if aim is None:  # lightning only, or nothing: just face them
+        if aim is None:  # arc only, or nothing: just face them
             aim = [math.atan2(tgt["pos"][1] - me["pos"][1], tgt["pos"][0] - me["pos"][0]), 0.0]
 
         cur = me["aim"]
