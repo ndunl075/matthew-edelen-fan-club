@@ -73,6 +73,8 @@ pub struct Memory {
     pub last_t: f64,
     pub range_fails: Vec<(i64, u32)>,
     pub range_ban: f64,
+    /// Forget drones that should be in view and are not (fix_npc_gone).
+    pub npc_gone: bool,
 }
 
 fn should_see(obs: &Obs, world: &World, cfg: &Config, p: V3) -> bool {
@@ -136,6 +138,7 @@ impl Memory {
             last_t: -1.0,
             range_fails: Vec::new(),
             range_ban: 0.0,
+            npc_gone: false,
         }
     }
 
@@ -274,6 +277,11 @@ impl Memory {
         }
 
         self.tracks.retain(|x| t - x.last_seen < 25.0 && !(x.kind == ActorKind::Npc && x.hp <= 0.0));
+        if self.npc_gone {
+            // no kill event reaches us when someone else kills a drone; like items, a drone that has not been reported
+            // for half a second although the spot we last saw it at is in plain view is no longer there
+            self.tracks.retain(|x| !(x.kind == ActorKind::Npc && t - x.last_seen > 0.5 && should_see(obs, world, cfg, x.pos)));
+        }
         self.tracks.sort_by_key(|x| x.id);
 
         let mut budget = 60i32;

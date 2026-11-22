@@ -94,6 +94,8 @@ impl Brain {
             max_range = max_range.max(r);
         }
         let mut best: Option<(f64, AimTarget, bool)> = None;
+        // best-scored mech that is hitting us and that the retreat / rest gate lets us fire at (fix_retreat_fire)
+        let mut answer: Option<(f64, AimTarget)> = None;
         let held = self.held(t);
         let gate = self.gate_closed(obs);
         for tr in &self.mem.tracks {
@@ -120,6 +122,9 @@ impl Brain {
             if !self.ffa_fire_ok(obs, tr, attacker, d, clear) {
                 continue;
             }
+            if !self.fight_open_ok(obs, tr, attacker) {
+                continue;
+            }
             let mut s = -0.3 * d + 40.0 * (1.0 - frac(tr.hp, tr.max_hp));
             if clear {
                 s += 100.0;
@@ -137,11 +142,20 @@ impl Brain {
             let to_us = (me.pos[1] - tr.pos[1]).atan2(me.pos[0] - tr.pos[0]);
             let aligned = adiff(tr.aim[0], to_us).abs() < 0.5;
             let allow = (if self.econ.resting { attacker || d < 45.0 } else { self.mode != Mode::Retreat || attacker || (aligned && clear) || d < 60.0 }) && !self.hold_fire(obs, d, tr.hp);
+            if self.p.fix_retreat_fire > 0.5 && attacker && allow && answer.as_ref().map_or(true, |b| s > b.0) {
+                answer = Some((s, at.clone()));
+            }
             if best.as_ref().map_or(true, |b| s > b.0) {
                 best = Some((s, at, allow));
             }
         }
         if let Some((_, at, allow)) = best {
+            if !allow {
+                // the gate is per mech but only the top score was kept: do not hold fire on it while another one shoots us
+                if let Some((_, at)) = answer {
+                    return Some((at, true));
+                }
+            }
             return Some((at, allow));
         }
         let mut bn: Option<(f64, AimTarget, bool)> = None;

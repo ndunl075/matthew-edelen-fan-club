@@ -48,11 +48,22 @@ impl Brain {
         obs.me.weapons.iter().position(|w| w.as_ref().map_or(false, |w| w.kind == WeaponKind::Laser))
     }
 
+    /// We stand inside the ring of a landed supply drop that has capture progress and no other holder.
+    pub(crate) fn drop_banked(&self, obs: &Obs) -> bool {
+        let me = &obs.me;
+        obs.drops.iter().any(|d| d.lands_in <= 0.0 && d.progress > 0.0 && d.holder.map_or(true, |h| h == me.id) && d.pos.iter().all(|x| x.is_finite()) && dist2(d.pos, me.pos) <= d.radius.max(2.0))
+    }
+
     pub(crate) fn laser_pre(&mut self, obs: &Obs, world: &World, nav: &Nav) {
         let p = self.p.clone();
         let t = obs.t;
         let pos = obs.me.pos;
-        if p.lz_seek > 0.0 && self.laser_slot(obs).is_none() && !matches!(self.mode, Mode::Zone) && (self.mode != Mode::Retreat || p.lz_seek_retreat > 0.5) {
+        // fix_keep_drop: the main decision chose the drop and the capture is running; the laser can wait the few seconds left
+        let keep_drop = p.fix_keep_drop > 0.5 && self.mode == Mode::Drop && self.drop_banked(obs);
+        if keep_drop {
+            self.lz_pursuit = (-1, t);
+        }
+        if p.lz_seek > 0.0 && !keep_drop && self.laser_slot(obs).is_none() && !matches!(self.mode, Mode::Zone) && (self.mode != Mode::Retreat || p.lz_seek_retreat > 0.5) {
             if self.want(&obs.me, WeaponKind::Laser).is_some() {
                 let z = &obs.zone;
                 let hot = t - self.mem.last_damage_t < p.lz_hot_s || self.mem.tracks.iter().any(|tr| tr.kind == ActorKind::Mech && t - tr.last_seen < p.lz_hot_s && dist(tr.pos_at(t), pos) < p.lz_hot_d);
@@ -63,14 +74,35 @@ impl Brain {
                     }
                     let d = dist(it.pos, pos);
                     let lim = if hot { p.lz_seek_fight } else { p.lz_seek };
-                    if self.sf_far_block(d) {
+                    if self.sf_far_block(d) || !self.open_item_ok(obs, it.pos) {
                         continue;
                     }
                     if d > lim || dist2v(it.pos, z.center) > z.radius - 8.0 {
                         continue;
                     }
+                    if p.fix_lz > 0.5 {
+                        // same rule as other loot: not an item the next circle will leave outside before we are back
+                        let walk = obs.me.stats.walk_speed.max(1.0);
+                        let out_next = dist2v(it.pos, z.next_center) - z.next_radius;
+                        if out_next > -5.0 && (z.shrink_end - t) < 25.0 + d / walk + out_next.max(0.0) / walk {
+                            continue;
+                        }
+                    }
                     if best.map_or(true, |b| d < b.0) {
                         best = Some((d, it.id, it.pos));
+                    }
+                }
+                if p.fix_lz > 0.5 {
+                    // own give-up timer: the main decision resets the shared one every tick it prefers another goal
+                    match best {
+                        Some((_, id, _)) if self.lz_pursuit.0 != id => self.lz_pursuit = (id, t),
+                        Some((_, id, _)) if t - self.lz_pursuit.1 > p.pursuit_max_s => {
+                            self.mem.ban(id, t + p.blacklist_s);
+                            self.lz_pursuit = (-1, t);
+                            best = None;
+                        }
+                        Some(_) => {}
+                        None => self.lz_pursuit = (-1, t),
                     }
                 }
                 if let Some((_, id, q)) = best {

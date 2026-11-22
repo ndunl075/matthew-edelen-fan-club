@@ -46,7 +46,7 @@ impl Ffa {
         }
     }
 
-    pub fn update(&mut self, obs: &Obs, tracks: &[Track], enabled: bool) {
+    pub fn update(&mut self, obs: &Obs, tracks: &[Track], enabled: bool, force: bool) {
         let t = obs.t;
         let me = &obs.me;
         if self.alive0 <= 0 {
@@ -70,6 +70,9 @@ impl Ffa {
         }
         if !enabled {
             return;
+        }
+        if force {
+            self.set(t, 3);
         }
         let deaths = self.alive0 - obs.alive;
         if t < 75.0 && deaths >= self.kills + 2 {

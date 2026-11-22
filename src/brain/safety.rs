@@ -84,12 +84,16 @@ impl Brain {
         if p.sf_nofirst < 0.5 || tr.kind != ActorKind::Mech || Self::sf_has_laser(obs) {
             return false;
         }
+        if p.nofirst_alive > 0.5 && (obs.alive as f64) <= p.nofirst_alive {
+            return false;
+        }
         let t = obs.t;
         if self.sf_hunter(tr, t) {
             return false;
         }
         let d = dist(tr.pos_at(t), obs.me.pos);
-        tr.has(WeaponKind::Laser) || d > p.sf_nf_close
+        let close = if self.opening(t) { p.open_nf_close } else { p.sf_nf_close };
+        tr.has(WeaponKind::Laser) || d > close
     }
 
     pub(crate) fn sf_no_mortar(&self) -> bool {

@@ -1,6 +1,7 @@
 use super::aim::FireOut;
 use super::math::*;
 use super::strategy::zone_at;
+use super::zap::zap_cost;
 use super::{Brain, Goal, Mode, Tgt};
 use crate::nav::Nav;
 use crate::physics::{self, Body, Drive};
@@ -462,7 +463,12 @@ impl Brain {
         } else {
             p.energy_reserve
         };
-        let allow_boost = me.grounded && me.energy > reserve && (matches!(self.mode, Mode::Zone | Mode::Retreat | Mode::Drop | Mode::Roof) || under_fire || !me.in_zone);
+        let zap = self.zap_carriers(obs);
+        let zap_boost = zap.iter().any(|c| dist2(*c, pos) < p.zap_r + 4.0 && world.sight(up(*c, self.cfg.mech.eye_height), center));
+        // too far inside the wanted distance (so_on): opening the gap may use boost and outweighs the side-step
+        let back_off = self.back_off && self.mode == Mode::Fight && matches!(self.goal, Goal::Range { .. });
+        let allow_boost = me.grounded && me.energy > reserve && (matches!(self.mode, Mode::Zone | Mode::Retreat | Mode::Drop | Mode::Roof) || under_fire || !me.in_zone || zap_boost || back_off);
+        let w_range = if back_off { p.w_range.max(p.so_back_w * p.w_juke / (walk * horizon).max(0.1)) } else { p.w_range };
         let slow = if fc.charging { st.charge_move_mult.clamp(0.1, 1.0) } else { 1.0 };
 
         // candidates
@@ -494,6 +500,7 @@ impl Brain {
         let (zc, zr) = zone_at(&obs.zone, t, t + horizon, self.zone_b);
         let z = &obs.zone;
         let next_soon = z.shrink_start - t < 15.0;
+        let keep_foes = self.keep_foes(obs);
 
         for c in cands.iter_mut() {
             let (pts, blocked) = simulate(world, me, c.dir, c.speed, slow, c.boost, n);
@@ -521,7 +528,7 @@ impl Brain {
                 Goal::Range { pos: g, pref } => {
                     let e0 = ((dist2(pos, g) - pref).abs() - p.range_band).max(0.0);
                     let e1 = ((dist2(end, g) - pref).abs() - p.range_band).max(0.0);
-                    s += p.w_range * (e0 - e1);
+                    s += w_range * (e0 - e1);
                 }
                 Goal::None => {
                     s -= 0.6 * dist2(end, pos);
@@ -557,11 +564,17 @@ impl Brain {
                     s -= p.w_next_zone * (on - o0.max(0.0));
                 }
             }
+            if !zap.is_empty() {
+                s -= zap_cost(&zap, end, p.zap_r, p.zap_w);
+            }
             for q in &npcs {
                 let d = dist(*q, end);
                 if d < p.npc_avoid {
                     s -= p.w_npc * (p.npc_avoid - d) * 0.2 + p.w_npc * (dist(*q, pos) - d).max(0.0);
                 }
+            }
+            if !keep_foes.is_empty() {
+                s += self.keep_term(&keep_foes, pos, end);
             }
             s -= p.w_proj * self.incoming_cost(c, &shots, &blasts, radius, height);
             if p.w_antilead > 0.0 {
