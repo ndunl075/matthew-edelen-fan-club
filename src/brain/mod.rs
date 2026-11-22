@@ -6,6 +6,7 @@ mod laser;
 mod econ;
 mod gear;
 mod ffa;
+mod gate;
 mod math;
 mod memory;
 mod order;
@@ -20,6 +21,7 @@ mod tele;
 #[cfg(test)]
 mod tests;
 mod wave;
+mod zap;
 
 pub use params::Params;
 
@@ -69,6 +71,10 @@ pub struct Brain {
     pub(crate) goal: Goal,
     pub(crate) goal_id: i64,
     pub(crate) pursuit: (i64, f64),
+    /// Retreat stays on until the exit health is reached, whatever mode a tick ends in (fix_latch).
+    pub(crate) retreat_latch: bool,
+    /// Laser seek keeps its own give-up timer: (pickup id, since) (fix_lz).
+    pub(crate) lz_pursuit: (i64, f64),
     pub(crate) target: Tgt,
     pub(crate) allow_crates: bool,
     pub(crate) field: Option<(V3, Arc<nav::Field>, f64)>,
@@ -144,6 +150,8 @@ impl Brain {
             goal: Goal::None,
             goal_id: -1,
             pursuit: (-1, 0.0),
+            retreat_latch: false,
+            lz_pursuit: (-1, 0.0),
             target: Tgt::None,
             allow_crates: false,
             field: None,
@@ -214,7 +222,7 @@ impl Brain {
             self.cad.update(obs, self.p.cad_period, self.p.cad_snap);
         }
         self.wave_update(obs, world, nav);
-        self.ffa.update(obs, &self.mem.tracks, self.p.ffa_on > 0.5);
+        self.ffa.update(obs, &self.mem.tracks, self.p.ffa_on > 0.5, self.p.ffa_force > 0.5);
         self.order.update(obs);
         self.tele_update(obs);
         if self.p.halt_multi >= 1.0 && !self.order.halted && self.order.on_us(obs.t) as f64 >= self.p.halt_multi {

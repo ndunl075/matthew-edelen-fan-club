@@ -31,6 +31,9 @@ impl Brain {
         if self.order.dmg(tr.id) >= p.gear_harmless_dmg {
             return false;
         }
+        if p.fix_harmless > 0.5 && t - tr.last_dmg_t < 3.0 {
+            return false;
+        }
         if tr.has(WeaponKind::Laser) && d < p.gear_laser_threat_r {
             return false;
         }
@@ -183,20 +186,26 @@ impl Brain {
         let wants_cube = me.cubes < p.gear_cube_cap || (me.cubes >= 13.0 && me.cubes < 15.0);
         let mut best: Option<(f64, i64, V3)> = None;
         for it in &self.mem.pickups {
-            if it.kind != WeaponKind::Laser || self.mem.blacklisted(it.id, t) || self.want(me, it.kind).is_none() || (it.pos[2] - me.pos[2]).abs() > 3.5 {
+            if it.kind != WeaponKind::Laser || self.mem.blacklisted(it.id, t) || self.want(me, it.kind).is_none() || (it.pos[2] - me.pos[2]).abs() > 3.5 || !self.zap_item_ok(obs, it.pos) {
                 continue;
             }
             let d = dist(it.pos, me.pos);
+            if p.fix_latch > 0.5 && !self.in_play_pub(obs, zi, it.pos, d) {
+                continue;
+            }
             if d < p.gear_grab_r && best.map_or(true, |b| d < b.0) {
                 best = Some((d, it.id, it.pos));
             }
         }
         if best.is_none() && wants_cube {
             for it in &self.mem.cubes {
-                if self.mem.blacklisted(it.id, t) || (it.pos[2] - me.pos[2]).abs() > 3.5 {
+                if self.mem.blacklisted(it.id, t) || (it.pos[2] - me.pos[2]).abs() > 3.5 || !self.zap_item_ok(obs, it.pos) {
                     continue;
                 }
                 let d = dist(it.pos, me.pos);
+                if p.fix_latch > 0.5 && !self.in_play_pub(obs, zi, it.pos, d) {
+                    continue;
+                }
                 if d < p.gear_grab_r && best.map_or(true, |b| d < b.0) {
                     best = Some((d, it.id, it.pos));
                 }

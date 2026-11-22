@@ -120,6 +120,9 @@ impl Brain {
             if !self.ffa_fire_ok(obs, tr, attacker, d, clear) {
                 continue;
             }
+            if !self.fight_open_ok(obs, tr, attacker) {
+                continue;
+            }
             let mut s = -0.3 * d + 40.0 * (1.0 - frac(tr.hp, tr.max_hp));
             if clear {
                 s += 100.0;

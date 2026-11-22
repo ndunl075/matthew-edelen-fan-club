@@ -349,6 +349,51 @@ pub struct Params {
     pub lz_scan_len: f64,
     pub lz_hold_lost: f64,
     pub take_range_ban: f64,
+    pub open_s: f64,
+    pub open_nf_close: f64,
+    pub open_avoid_r: f64,
+    pub keep_w: f64,
+    pub keep_d: f64,
+    pub keep_s: f64,
+    pub keep_weak_hp: f64,
+    /// Final-round rules (all off by default; see `Params::parse`).
+    pub ffa_force: f64,
+    pub fix_harmless: f64,
+    pub nofirst_alive: f64,
+    pub fix_latch: f64,
+    pub fix_lz: f64,
+    pub fg_on: f64,
+    pub fg_hp: f64,
+    pub fg_crowd: f64,
+    pub fg_weak: f64,
+    pub fg_third_r: f64,
+    pub fg_third_hp: f64,
+    /// Repair at supply drops: switch (0 off), hp fraction below which a landed drop is worth a trip,
+    /// reach in metres when calm and during a fight, and the distance to a seen mech that counts as a fight.
+    pub drop_rep: f64,
+    pub drop_rep_hp: f64,
+    pub drop_rep_calm: f64,
+    pub drop_rep_fight: f64,
+    pub drop_rep_near: f64,
+    /// Anti-lightning field: switch (0 off), radius kept from every seen lightning carrier, path cost weight,
+    /// hp fraction and energy above which our own lightning makes the field unnecessary, and how long a carrier
+    /// stays in view after it was last seen.
+    pub zap_avoid: f64,
+    pub zap_r: f64,
+    pub zap_w: f64,
+    pub zap_min_hp: f64,
+    pub zap_energy: f64,
+    pub zap_seen_s: f64,
+    /// Rest after N kills: 0 off, otherwise from the Nth kill on, between fights, rest below `rest_kills_hp`
+    /// until `rest_kills_exit` of full health.
+    pub rest_kills: f64,
+    pub rest_kills_hp: f64,
+    pub rest_kills_exit: f64,
+    /// Duel stance: with two mechs left (us and one other), engage at any odds out to `duel_range` metres,
+    /// ignore the fight gates and retreat only below `duel_retreat_hp`.
+    pub duel_on: f64,
+    pub duel_retreat_hp: f64,
+    pub duel_range: f64,
 }
 
 impl Default for Params {
@@ -720,6 +765,41 @@ impl Default for Params {
             lz_scan_len: 1.6,
             lz_hold_lost: 0.0,
             take_range_ban: 0.0,
+            open_s: 0.0,
+            open_nf_close: 0.0,
+            open_avoid_r: 0.0,
+            keep_w: 0.0,
+            keep_d: 135.0,
+            keep_s: 90.0,
+            keep_weak_hp: 0.4,
+            ffa_force: 0.0,
+            fix_harmless: 0.0,
+            nofirst_alive: 0.0,
+            fix_latch: 0.0,
+            fix_lz: 0.0,
+            fg_on: 0.0,
+            fg_hp: 0.85,
+            fg_crowd: 150.0,
+            fg_weak: 0.35,
+            fg_third_r: 140.0,
+            fg_third_hp: 0.9,
+            drop_rep: 0.0,
+            drop_rep_hp: 0.95,
+            drop_rep_calm: 250.0,
+            drop_rep_fight: 70.0,
+            drop_rep_near: 150.0,
+            zap_avoid: 0.0,
+            zap_r: 66.0,
+            zap_w: 180.0,
+            zap_min_hp: 0.55,
+            zap_energy: 18.0,
+            zap_seen_s: 2.5,
+            rest_kills: 0.0,
+            rest_kills_hp: 0.95,
+            rest_kills_exit: 0.99,
+            duel_on: 0.0,
+            duel_retreat_hp: 0.2,
+            duel_range: 400.0,
         }
     }
 }
@@ -730,12 +810,38 @@ impl Params {
         let base = Params::default();
         let Ok(path) = std::env::var("MECH_PARAMS") else { return base };
         let Ok(text) = std::fs::read_to_string(&path) else { return base };
-        match serde_json::from_str::<Params>(&text) {
+        let fin = Params::final_now();
+        match Params::parse(&text, fin) {
             Ok(p) => p,
             Err(e) => {
                 crate::runtime::log(&format!("MECH_PARAMS ignored: {e}"));
-                base
+                // a bad "final" block must not cost the base settings
+                if fin { Params::parse(&text, false).unwrap_or(base) } else { base }
             }
         }
+    }
+
+    /// The settings file may carry a "final" object: settings that replace the top-level ones in the final round only.
+    pub fn parse(text: &str, fin: bool) -> Result<Params, serde_json::Error> {
+        let mut v: serde_json::Value = serde_json::from_str(text)?;
+        let over = v.as_object_mut().and_then(|m| m.remove("final"));
+        if fin {
+            if let (Some(m), Some(serde_json::Value::Object(o))) = (v.as_object_mut(), over) {
+                for (k, x) in o {
+                    m.insert(k, x);
+                }
+            }
+        }
+        serde_json::from_value(v)
+    }
+
+    /// The final round is played after the practice board closes (2026-11-22 16:00 UTC). MECH_FINAL=1 / 0 overrides for tests.
+    pub fn final_now() -> bool {
+        match std::env::var("MECH_FINAL").ok().as_deref() {
+            Some("1") => return true,
+            Some("0") => return false,
+            _ => {}
+        }
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(false, |d| d.as_secs() >= 1_795_363_200)
     }
 }

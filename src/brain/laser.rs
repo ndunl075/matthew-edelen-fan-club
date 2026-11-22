@@ -63,14 +63,35 @@ impl Brain {
                     }
                     let d = dist(it.pos, pos);
                     let lim = if hot { p.lz_seek_fight } else { p.lz_seek };
-                    if self.sf_far_block(d) {
+                    if self.sf_far_block(d) || !self.open_item_ok(obs, it.pos) {
                         continue;
                     }
                     if d > lim || dist2v(it.pos, z.center) > z.radius - 8.0 {
                         continue;
                     }
+                    if p.fix_lz > 0.5 {
+                        // same rule as other loot: not an item the next circle will leave outside before we are back
+                        let walk = obs.me.stats.walk_speed.max(1.0);
+                        let out_next = dist2v(it.pos, z.next_center) - z.next_radius;
+                        if out_next > -5.0 && (z.shrink_end - t) < 25.0 + d / walk + out_next.max(0.0) / walk {
+                            continue;
+                        }
+                    }
                     if best.map_or(true, |b| d < b.0) {
                         best = Some((d, it.id, it.pos));
+                    }
+                }
+                if p.fix_lz > 0.5 {
+                    // own give-up timer: the main decision resets the shared one every tick it prefers another goal
+                    match best {
+                        Some((_, id, _)) if self.lz_pursuit.0 != id => self.lz_pursuit = (id, t),
+                        Some((_, id, _)) if t - self.lz_pursuit.1 > p.pursuit_max_s => {
+                            self.mem.ban(id, t + p.blacklist_s);
+                            self.lz_pursuit = (-1, t);
+                            best = None;
+                        }
+                        Some(_) => {}
+                        None => self.lz_pursuit = (-1, t),
                     }
                 }
                 if let Some((_, id, q)) = best {
