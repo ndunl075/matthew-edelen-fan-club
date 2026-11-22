@@ -1,0 +1,922 @@
+use super::math::*;
+use super::*;
+use std::f64::consts::PI;
+
+#[test]
+fn angle_wrap() {
+    assert!((wrap(3.0 * PI) - PI).abs() < 1e-9);
+    assert!((wrap(-3.0 * PI) - PI).abs() < 1e-9);
+    assert!((adiff(3.1, -3.1) - (6.2 - 2.0 * PI)).abs() < 1e-9);
+    assert!((adiff(-3.1, 3.1) + (6.2 - 2.0 * PI)).abs() < 1e-9);
+    assert_eq!(wrap(f64::NAN), 0.0);
+    let s = slew([3.1, 0.0], [-3.1, 0.5], 0.2, 0.15);
+    assert!((adiff(s[0], -3.1)).abs() < 1e-9 && (s[1] - 0.15).abs() < 1e-9);
+    let s = slew([0.0, 0.0], [2.0, -1.0], 0.2, 0.15);
+    assert!((s[0] - 0.2).abs() < 1e-9 && (s[1] + 0.15).abs() < 1e-9);
+    let a = dir_to_aim(aim_dir(-2.5, 0.4));
+    assert!((a[0] + 2.5).abs() < 1e-9 && (a[1] - 0.4).abs() < 1e-9);
+}
+
+#[test]
+fn intercept() {
+    let p = [100.0, 0.0, 0.0];
+    let v = [0.0, 11.7, 0.0];
+    let t = intercept_time(p, v, 252.0).unwrap();
+    let hit = add(p, scale(v, t));
+    assert!((len(hit) - 252.0 * t).abs() < 1e-6);
+    assert!(t > 0.39 && t < 0.41);
+    // receding faster than the shot
+    assert!(intercept_time([10.0, 0.0, 0.0], [300.0, 0.0, 0.0], 252.0).is_none());
+    // approaching
+    let t = intercept_time([100.0, 0.0, 0.0], [-20.0, 0.0, 0.0], 252.0).unwrap();
+    assert!((t - 100.0 / 272.0).abs() < 1e-9);
+    let (pt, tf) = lead(p, v, [0.0; 3], 252.0, 0.05, 0.0, 0.3).unwrap();
+    let truth = add(p, scale(v, 0.05 + tf));
+    assert!(dist(pt, truth) < 1e-6);
+    let (pt, tf) = lead(p, v, [0.0, -20.0, 0.0], 252.0, 0.0, 1.0, 1.0).unwrap();
+    let truth = add(add(p, scale(v, tf)), scale([0.0, -20.0, 0.0], 0.5 * tf * tf));
+    assert!(dist(pt, truth) < 0.05);
+}
+
+#[test]
+fn mortar() {
+    for &(d, dz) in &[(80.0, 0.0), (150.0, -9.0), (40.0, 12.0), (200.0, 5.0)] {
+        for high in [false, true] {
+            let (pitch, tf) = mortar_solution(d, dz, 72.0, 22.0, high).unwrap();
+            let (mut x, mut z, mut t) = (0.0, 0.0, 0.0);
+            let (vx, mut vz) = (72.0 * pitch.cos(), 72.0 * pitch.sin());
+            let h = 1e-4;
+            while t < tf {
+                x += vx * h;
+                z += vz * h - 0.5 * 22.0 * h * h;
+                vz -= 22.0 * h;
+                t += h;
+            }
+            assert!((x - d).abs() < 0.1, "x {x} d {d}");
+            assert!((z - dz).abs() < 0.1, "z {z} dz {dz}");
+            if high {
+                assert!(pitch > PI / 4.0 - 0.1);
+            }
+        }
+    }
+    assert!(mortar_solution(400.0, 0.0, 72.0, 22.0, false).is_none());
+    assert!(mortar_solution(0.0, 0.0, 72.0, 22.0, false).is_none());
+}
+
+#[test]
+fn closest_approach() {
+    let (t, d, dz) = closest_xy([-10.0, 3.0, 1.0], [100.0, 0.0, -5.0], 0.0, 1.0);
+    assert!((t - 0.1).abs() < 1e-9 && (d - 3.0).abs() < 1e-9 && (dz - 0.5).abs() < 1e-9);
+    let (t, d, _) = closest_xy([-10.0, 3.0, 0.0], [100.0, 0.0, 0.0], 0.0, 0.05);
+    assert!((t - 0.05).abs() < 1e-9 && (d - (25.0f64 + 9.0).sqrt()).abs() < 1e-9);
+    let (t, d, _) = closest_xy([4.0, 3.0, 0.0], [0.0, 0.0, 0.0], 0.0, 1.0);
+    assert!(t == 0.0 && (d - 5.0).abs() < 1e-9);
+}
+
+#[test]
+fn rng_is_deterministic() {
+    let mut a = Rng::new(7);
+    let mut b = Rng::new(7);
+    for _ in 0..100 {
+        let x = a.f64();
+        assert_eq!(x, b.f64());
+        assert!((0.0..1.0).contains(&x));
+    }
+}
+
+fn check_action(a: &crate::proto::Action, tick: i64) {
+    assert_eq!(a.tick, tick);
+    let m = a.move_.expect("move");
+    assert!(m[0].is_finite() && m[1].is_finite() && m[0].hypot(m[1]) <= 1.0 + 1e-9);
+    let aim = a.aim.expect("aim");
+    assert!(aim[0].is_finite() && aim[1].is_finite());
+    assert!(aim[0].abs() <= PI + 1e-9 && aim[1] >= -0.7 - 1e-9 && aim[1] <= 1.3 + 1e-9);
+    assert!(a.fire.is_some());
+    if let Some(pk) = a.pick {
+        assert!((0..=2).contains(&pk));
+    }
+}
+
+fn run_stream(shared: Arc<Shared>, lines: &[String]) -> usize {
+    let mut brain: Option<Brain> = None;
+    let mut n = 0;
+    let mut moved = 0;
+    for l in lines {
+        match serde_json::from_str::<crate::proto::ServerMsg>(l) {
+            Ok(crate::proto::ServerMsg::Hello(h)) => brain = Some(Brain::with_params(&h, shared.clone(), Params::default())),
+            Ok(crate::proto::ServerMsg::Obs(o)) => {
+                let b = brain.as_mut().expect("hello first");
+                let t0 = std::time::Instant::now();
+                let a = b.act(&o, &Budget::unlimited());
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                if std::env::var("MECH_TRACE").is_ok() {
+                    eprintln!("{} {:.2}ms hp={:.0} e={:.0} mv={:?} b={:?} aim={:?}/{:?} fire={:?} rl={:?} take={:?} | {}", o.tick, ms, o.me.hp, o.me.energy, a.move_.map(|m| [(m[0] * 100.0).round() / 100.0, (m[1] * 100.0).round() / 100.0]), a.boost, a.aim.map(|m| [(m[0] * 100.0).round() / 100.0, (m[1] * 100.0).round() / 100.0]), [(o.me.aim[0] * 100.0).round() / 100.0, (o.me.aim[1] * 100.0).round() / 100.0], a.fire, a.reload, a.take, b.state());
+                }
+                check_action(&a, o.tick);
+                if a.move_.map_or(false, |m| m[0].hypot(m[1]) > 0.5) {
+                    moved += 1;
+                }
+                n += 1;
+            }
+            _ => {}
+        }
+    }
+    assert!(moved > 0 || n == 0);
+    n
+}
+
+/// Set MECH_STREAM to a decompressed recording (and MECH_MAP to the map dir) to run.
+#[test]
+fn recorded_stream() {
+    let Ok(path) = std::env::var("MECH_STREAM") else { return };
+    let text = std::fs::read_to_string(path).expect("stream");
+    let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    let cfg = crate::proto::Config::default();
+    let empty = Arc::new(Shared { world: crate::world::World::empty(), nav: crate::nav::Nav::build(&crate::world::World::empty(), &cfg.mech) });
+    let n = run_stream(empty, &lines);
+    assert!(n >= 300, "only {n} observations");
+    if let Ok(dir) = std::env::var("MECH_MAP") {
+        let shared = Arc::new(Shared::load(std::path::Path::new(&dir), &cfg));
+        let t0 = std::time::Instant::now();
+        let n = run_stream(shared, &lines);
+        eprintln!("map run: {n} obs, {:.3} ms/obs", t0.elapsed().as_secs_f64() * 1000.0 / n as f64);
+    }
+}
+
+#[test]
+fn degenerate_obs() {
+    let hello = crate::proto::Hello::default();
+    let cfg = &hello.config;
+    let shared = Arc::new(Shared { world: crate::world::World::empty(), nav: crate::nav::Nav::build(&crate::world::World::empty(), &cfg.mech) });
+    let mut b = Brain::with_params(&hello, shared, Params::default());
+    let o: crate::proto::Obs = serde_json::from_str("{}").unwrap();
+    let a = b.act(&o, &Budget::unlimited());
+    check_action(&a, 0);
+    let o: crate::proto::Obs = serde_json::from_str(
+        r#"{"tick":2,"t":0.1,"self":{"id":1,"pos":[0,0,0],"hp":0,"max_hp":0,"weapons":[null,null],"stats":{"walk_speed":0,"radius":0,"height":0,"turn_rate":0}},
+        "mechs":[{"id":2,"kind":"mech","pos":[0,0,0]},{"id":3,"kind":"weird","pos":[1e308,1e308,1e308],"vel":[1e308,-1e308,0]}],
+        "projectiles":[{"id":9,"kind":"mortar","pos":[0,0,50],"vel":[0,0,0]},{"id":10,"kind":"gun","pos":[0,0,0],"vel":[0,0,0]}],
+        "zone":{"radius":0,"next_radius":0},"offer":{"id":1,"choices":[]},
+        "drops":[{"id":20000,"pos":[0,0,0],"radius":0}],"crates":[{"id":1000,"pos":[5,5,0]}],"cubes":[{"id":5000,"pos":[1,1,0]}],
+        "pickups":[{"id":8000,"kind":"laser","pos":[0,1,0]}],"events":[{"type":"damaged","amount":10,"weapon":"gun","bearing":1.0,"by":2},{"type":"nonsense"}]}"#,
+    )
+    .unwrap();
+    let a = b.act(&o, &Budget::unlimited());
+    check_action(&a, 2);
+    assert_eq!(a.take, Some(8000));
+}
+
+fn zone_obs(z: &[([f64; 2], f64)], cfg: &crate::proto::Config, i: usize, t: f64, t0: f64, live: bool) -> crate::proto::ZoneObs {
+    let ph = &cfg.zone.phases[i.min(cfg.zone.phases.len() - 1)];
+    let ss = t0 + ph.hold_s;
+    let se = ss + ph.shrink_s;
+    let (c0, r0) = z[i];
+    let (c1, r1) = z[i + 1];
+    let k = if live { ((t - ss) / (se - ss)).clamp(0.0, 1.0) } else { 0.0 };
+    crate::proto::ZoneObs { center: [c0[0] + (c1[0] - c0[0]) * k, c0[1] + (c1[1] - c0[1]) * k], radius: r0 + (r1 - r0) * k, next_center: c1, next_radius: r1, shrink_start: ss, shrink_end: se, dps: ph.dps }
+}
+
+/// Needs MECH_MAP. MECH_RUNS sets the number of runs.
+#[test]
+fn zone_walk() {
+    let Ok(dir) = std::env::var("MECH_MAP") else { return };
+    let hello = crate::proto::Hello::default();
+    let cfg = hello.config.clone();
+    let shared = Arc::new(Shared::load(std::path::Path::new(&dir), &cfg));
+    let runs: usize = std::env::var("MECH_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let mut rng = Rng::new(12345);
+    let mut worst_ms: f64 = 0.0;
+    let (mut total_early, mut total_unstick, mut bad_runs) = (0.0, 0u32, 0usize);
+    for run in 0..runs {
+        let live = run % 2 == 0;
+        let mut z = vec![(cfg.zone.start_center, cfg.zone.start_radius)];
+        for ph in &cfg.zone.phases {
+            let (c, r) = *z.last().unwrap();
+            let a = rng.range(0.0, 2.0 * PI);
+            let d = (r - ph.radius).max(0.0) * rng.range(0.0, 0.95);
+            z.push(([c[0] + d * a.cos(), c[1] + d * a.sin()], ph.radius));
+        }
+        let start = loop {
+            let a = rng.range(0.0, 2.0 * PI);
+            let d = cfg.zone.start_radius * 0.8 * rng.f64().sqrt();
+            let (x, y) = (z[0].0[0] + d * a.cos(), z[0].0[1] + d * a.sin());
+            let q = [x, y, shared.world.terrain_z(x, y)];
+            if let Some(s) = shared.nav.snap(q) {
+                if dist(s, q) < 3.0 {
+                    break s;
+                }
+            }
+        };
+        if std::env::var("MECH_ONLY").ok().and_then(|s| s.parse::<usize>().ok()).map_or(false, |o| o != run) {
+            continue;
+        }
+        let mut h = hello.clone();
+        h.seed = run as i64 * 77 + 5;
+        let mut brain = Brain::with_params(&h, shared.clone(), Params::default());
+        let mut body = crate::physics::Body::new(start, cfg.mech.energy);
+        let mut aim = [0.0, 0.0];
+        let (mut phase, mut t0) = (0usize, 0.0);
+        let mut hp = cfg.mech.hp;
+        let (mut out_s, mut zone_dmg, mut still_s, mut early_dmg) = (0.0, 0.0, 0.0, 0.0);
+        let mut tick = 0i64;
+        let end_t: f64 = cfg.zone.phases.iter().map(|p| p.hold_s + p.shrink_s).sum::<f64>() - 12.0;
+        while (tick as f64) * 0.05 < end_t {
+            let t = tick as f64 * 0.05;
+            while phase < cfg.zone.phases.len() - 1 && t >= t0 + cfg.zone.phases[phase].hold_s + cfg.zone.phases[phase].shrink_s {
+                t0 += cfg.zone.phases[phase].hold_s + cfg.zone.phases[phase].shrink_s;
+                phase += 1;
+            }
+            let zl = zone_obs(&z, &cfg, phase, t, t0, true);
+            let zo = zone_obs(&z, &cfg, phase, t, t0, live);
+            let inside = dist2v(body.pos, zl.center) <= zl.radius;
+            let mut o = crate::proto::Obs::default();
+            o.tick = tick;
+            o.t = t;
+            o.alive = 16;
+            o.me.pos = body.pos;
+            o.me.vel = body.vel;
+            o.me.aim = aim;
+            o.me.hp = hp;
+            o.me.max_hp = cfg.mech.hp;
+            o.me.energy = body.energy;
+            o.me.max_energy = cfg.mech.energy;
+            o.me.grounded = body.grounded;
+            o.me.in_zone = inside;
+            o.me.stats = cfg.mech.clone();
+            o.me.weapons = [Some(crate::proto::WeaponObs { kind: WeaponKind::Gun, ammo: 12.0, stats: cfg.weapons.gun.clone(), ..Default::default() }), None];
+            o.zone = zo;
+            let w0 = std::time::Instant::now();
+            let a = brain.act(&o, &Budget::from_now_ms(30.0));
+            worst_ms = worst_ms.max(w0.elapsed().as_secs_f64() * 1000.0);
+            check_action(&a, tick);
+            let drive = crate::physics::Drive { mv: a.move_.unwrap_or([0.0, 0.0]), boost: a.boost.unwrap_or(false), jump: a.jump.unwrap_or(false), speed_mult: 1.0 };
+            let before = body.pos;
+            for k in 0..2 {
+                let mut d = drive;
+                d.jump = d.jump && k == 0;
+                crate::physics::step(&shared.world, &cfg.mech, &mut body, &d, 0.05);
+                aim = crate::physics::slew_aim(aim, a.aim.unwrap_or(aim), &cfg.mech, 1.0, 0.05);
+            }
+            if std::env::var("MECH_ZTRACE").is_ok() && tick % 20 == 0 {
+                eprintln!("  t={:.0} pos=({:.1},{:.1},{:.1}) g={} dn={:.1}/{:.1} dc={:.1}/{:.1} mv={:?} b={:?} j={:?} us={} | {}", t, body.pos[0], body.pos[1], body.pos[2], body.grounded, dist2v(body.pos, zl.next_center), zl.next_radius, dist2v(body.pos, zl.center), zl.radius, a.move_.map(|m| [(m[0] * 100.0).round() / 100.0, (m[1] * 100.0).round() / 100.0]), a.boost, a.jump, brain.unstick_count, brain.state());
+            }
+            if std::env::var("MECH_ZDBG").ok().and_then(|s| s.parse::<i64>().ok()) == Some(tick) {
+                eprintln!("DBG tick {tick} pos {:?}\n{}", body.pos, brain.dbg);
+            }
+            if !inside {
+                out_s += 0.1;
+                if phase + 1 < cfg.zone.phases.len() {
+                    early_dmg += zl.dps * 0.1;
+                }
+                zone_dmg += zl.dps * 0.1;
+                hp = (hp - zl.dps * 0.1).max(1.0);
+            }
+            if dist(before, body.pos) < 0.02 && dist2v(body.pos, zl.next_center) > zl.next_radius {
+                still_s += 0.1;
+            }
+            tick += 2;
+        }
+        let zl = zone_obs(&z, &cfg, phase, end_t, t0, true);
+        eprintln!("run {run} live={live} start=({:.0},{:.0}) outside {:.1}s zone_dmg {:.0} (before last phase {early_dmg:.0}) still_outside_next {:.1}s unstick {} final_dist {:.1} (r {:.1}) worst {:.1}ms", start[0], start[1], out_s, zone_dmg, still_s, brain.unstick_count, dist2v(body.pos, zl.next_center), zl.radius, worst_ms);
+        total_early += early_dmg;
+        if early_dmg > 100.0 {
+            bad_runs += 1;
+        }
+        total_unstick += brain.unstick_count;
+    }
+    eprintln!("zone_walk: {runs} runs, {bad_runs} with zone damage before the last phase ({total_early:.0} in total), {total_unstick} unsticks, worst {worst_ms:.1} ms");
+    assert!(bad_runs * 10 <= runs, "{bad_runs} of {runs} runs took zone damage early");
+}
+
+/// Needs MECH_MAP.
+#[test]
+fn stress_timing() {
+    let Ok(dir) = std::env::var("MECH_MAP") else { return };
+    let hello = crate::proto::Hello::default();
+    let cfg = hello.config.clone();
+    let shared = Arc::new(Shared::load(std::path::Path::new(&dir), &cfg));
+    let mut rng = Rng::new(99);
+    let mut brain = Brain::with_params(&hello, shared.clone(), Params::default());
+    let mut times: Vec<f64> = Vec::new();
+    let mut fired = 0;
+    let c0 = [60.0, -20.0];
+    for i in 0..400i64 {
+        let t = i as f64 * 0.1;
+        let x = c0[0] + 30.0 * (t * 0.2).cos();
+        let y = c0[1] + 30.0 * (t * 0.2).sin();
+        let me_pos = shared.nav.snap([x, y, shared.world.terrain_z(x, y)]).unwrap_or([x, y, 0.0]);
+        let mut o = crate::proto::Obs::default();
+        o.tick = i * 2;
+        o.t = t;
+        o.alive = 16;
+        o.me.pos = me_pos;
+        o.me.aim = [t * 0.5, 0.0];
+        o.me.max_hp = 1400.0;
+        o.me.hp = if i < 200 { 1400.0 } else { 300.0 };
+        o.me.energy = 80.0;
+        o.me.max_energy = 100.0;
+        o.me.grounded = true;
+        o.me.in_zone = true;
+        o.me.stats = cfg.mech.clone();
+        let second = match (i / 100) % 3 {
+            0 => Some(crate::proto::WeaponObs { kind: WeaponKind::Laser, charge: if i % 10 > 2 { 0.1 * (i % 10) as f64 } else { 0.0 }, stats: cfg.weapons.laser.clone(), ..Default::default() }),
+            1 => Some(crate::proto::WeaponObs { kind: WeaponKind::Mortar, stats: cfg.weapons.mortar.clone(), ..Default::default() }),
+            _ => Some(crate::proto::WeaponObs { kind: WeaponKind::Lightning, stats: cfg.weapons.lightning.clone(), ..Default::default() }),
+        };
+        o.me.weapons = [Some(crate::proto::WeaponObs { kind: WeaponKind::Gun, ammo: 12.0, stats: cfg.weapons.gun.clone(), ..Default::default() }), second];
+        for k in 0..15i64 {
+            let a = k as f64 * 0.42 + t * 0.05;
+            let d = 30.0 + 12.0 * k as f64;
+            let (ex, ey) = (me_pos[0] + d * a.cos(), me_pos[1] + d * a.sin());
+            let ez = shared.world.terrain_z(ex, ey);
+            o.mechs.push(crate::proto::ActorObs { id: k + 1, kind: crate::proto::ActorKind::Mech, pos: [ex, ey, ez], vel: [5.0 * a.sin(), -5.0 * a.cos(), 0.0], aim: [a + PI, 0.0], hp: Some(900.0), max_hp: Some(1400.0), cubes: 0.0, weapons: vec![WeaponKind::Gun, WeaponKind::Laser], charging: k % 3 == 0 });
+            for j in 0..3 {
+                let s = 0.3 + 0.2 * j as f64;
+                o.projectiles.push(crate::proto::ProjectileObs { id: 300 + k * 3 + j, kind: if j == 2 { crate::proto::ProjKind::Mortar } else { crate::proto::ProjKind::Gun }, pos: [ex - s * d * a.cos(), ey - s * d * a.sin(), ez + 7.0], vel: if j == 2 { [-40.0 * a.cos(), -40.0 * a.sin(), 20.0] } else { [-252.0 * a.cos(), -252.0 * a.sin(), 0.0] } });
+            }
+        }
+        for k in 0..12i64 {
+            let (px, py) = (me_pos[0] + rng.range(-80.0, 80.0), me_pos[1] + rng.range(-80.0, 80.0));
+            let pz = shared.world.terrain_z(px, py);
+            o.crates.push(crate::proto::ItemObs { id: 1000 + k, pos: [px, py, pz], hp: Some(300.0) });
+            o.cubes.push(crate::proto::ItemObs { id: 5000 + k, pos: [px + 3.0, py, pz], hp: None });
+            o.pickups.push(crate::proto::PickupObs { id: 8000 + k, kind: WeaponKind::Laser, pos: [px, py + 3.0, pz] });
+        }
+        if i % 7 == 0 {
+            o.events.push(crate::proto::Event::Damaged(crate::proto::DamagedEv { amount: 45.0, weapon: "gun".into(), bearing: Some(1.0), by: Some(1 + i % 15), rear: false }));
+        }
+        o.zone = crate::proto::ZoneObs { center: [41.3, -72.8], radius: 380.0, next_center: [50.0, -30.0], next_radius: 240.0, shrink_start: 105.0, shrink_end: 145.0, dps: 35.0 };
+        let w0 = std::time::Instant::now();
+        let a = brain.act(&o, &Budget::from_now_ms(30.0));
+        times.push(w0.elapsed().as_secs_f64() * 1000.0);
+        check_action(&a, o.tick);
+        if a.fire.map_or(false, |f| f[0] || f[1]) {
+            fired += 1;
+        }
+    }
+    times.sort_by(|a, b| a.total_cmp(b));
+    eprintln!("stress: p50 {:.2} ms  p90 {:.2}  p99 {:.2}  max {:.2}  fired on {fired}/400", times[200], times[360], times[396], times[399]);
+    assert!(times[399] < 40.0);
+}
+
+fn scene_brain(p: Params) -> Brain {
+    // the empty world and its walk graph are the same for every scene: build them once per test binary
+    static SHARED: std::sync::OnceLock<Arc<Shared>> = std::sync::OnceLock::new();
+    let hello = crate::proto::Hello::default();
+    let shared = SHARED.get_or_init(|| Arc::new(Shared { world: crate::world::World::empty(), nav: crate::nav::Nav::build(&crate::world::World::empty(), &hello.config.mech) })).clone();
+    Brain::with_params(&hello, shared, p)
+}
+
+/// A calm open field: we stand at the origin with a gun, full energy, zone far away.
+fn scene_obs(t: f64, hp: f64) -> crate::proto::Obs {
+    let cfg = crate::proto::Config::default();
+    let mut o = crate::proto::Obs::default();
+    o.tick = (t * 20.0) as i64;
+    o.t = t;
+    o.alive = 8;
+    o.me.id = 1;
+    o.me.pos = [0.0, 0.0, 0.0];
+    o.me.hp = hp;
+    o.me.max_hp = 1400.0;
+    o.me.energy = 100.0;
+    o.me.max_energy = 100.0;
+    o.me.grounded = true;
+    o.me.in_zone = true;
+    o.me.stats = cfg.mech.clone();
+    o.me.weapons = [Some(crate::proto::WeaponObs { kind: WeaponKind::Gun, ammo: 12.0, stats: cfg.weapons.gun.clone(), ..Default::default() }), None];
+    o.zone = crate::proto::ZoneObs { center: [0.0, 0.0], radius: 500.0, next_center: [0.0, 0.0], next_radius: 400.0, shrink_start: 1000.0, shrink_end: 1100.0, dps: 5.0 };
+    o
+}
+
+fn enemy(id: i64, pos: V3, weapons: Vec<WeaponKind>) -> crate::proto::ActorObs {
+    crate::proto::ActorObs { id, kind: crate::proto::ActorKind::Mech, pos, vel: [0.0; 3], aim: [PI, 0.0], hp: Some(1400.0), max_hp: Some(1400.0), cubes: 0.0, weapons, charging: false }
+}
+
+fn hit_by(id: i64) -> crate::proto::Event {
+    crate::proto::Event::Damaged(crate::proto::DamagedEv { amount: 20.0, weapon: "gun".into(), bearing: Some(0.0), by: Some(id), rear: false })
+}
+
+fn landed_drop(pos: V3) -> crate::proto::DropObs {
+    crate::proto::DropObs { id: 20000, pos, radius: 8.0, lands_in: 0.0, capture_s: 4.0, progress: 0.0, holder: None }
+}
+
+/// Run a few decisions on the same scene and return the brain.
+fn settle(p: Params, make: impl Fn(f64) -> crate::proto::Obs) -> Brain {
+    let mut b = scene_brain(p);
+    for i in 0..6 {
+        let o = make(1.0 + i as f64 * 0.1);
+        let a = b.act(&o, &Budget::unlimited());
+        check_action(&a, o.tick);
+    }
+    b
+}
+
+#[test]
+fn drop_repair_in_a_fight() {
+    // hurt, shot at by a mech 100 m away, landed drop 60 m the other way
+    let fight = |hp: f64, drop_at: f64| {
+        move |t: f64| {
+            let mut o = scene_obs(t, hp);
+            o.mechs.push(enemy(7, [100.0, 0.0, 0.0], vec![WeaponKind::Gun]));
+            o.events.push(hit_by(7));
+            o.drops.push(landed_drop([-drop_at, 0.0, 0.0]));
+            o
+        }
+    };
+    let mut on = Params::default();
+    on.drop_rep = 1.0;
+    // off: the fight goes on (drop 60 m is beyond the old 50 m fight reach)
+    assert_eq!(settle(Params::default(), fight(900.0, 60.0)).mode, Mode::Fight);
+    // on: go and take the drop inside 70 m
+    assert_eq!(settle(on.clone(), fight(900.0, 60.0)).mode, Mode::Drop);
+    // too far for a fight, healthy enough, or not landed: no trip
+    assert_eq!(settle(on.clone(), fight(900.0, 100.0)).mode, Mode::Fight);
+    assert_eq!(settle(on.clone(), fight(1390.0, 60.0)).mode, Mode::Fight);
+    let unlanded = |t: f64| {
+        let mut o = fight(900.0, 60.0)(t);
+        o.drops[0].lands_in = 5.0;
+        o
+    };
+    assert_eq!(settle(on, unlanded).mode, Mode::Fight);
+}
+
+#[test]
+fn drop_repair_when_calm() {
+    let calm = |hp: f64, d: f64| {
+        move |t: f64| {
+            let mut o = scene_obs(t, hp);
+            o.drops.push(landed_drop([d, 0.0, 0.0]));
+            o
+        }
+    };
+    let mut on = Params::default();
+    on.drop_rep = 1.0;
+    let b = settle(on.clone(), calm(900.0, 230.0));
+    assert_eq!(b.mode, Mode::Drop);
+    // beyond 250 m the repair rule does not fire
+    let mut b = scene_brain(on);
+    let o = calm(900.0, 280.0)(1.0);
+    b.act(&o, &Budget::unlimited());
+    let sh = b.shared.clone();
+    let zi = b.zone_info(&o, &sh.world, &sh.nav);
+    assert!(b.drop_repair(&o, &zi, 900.0 / 1400.0, 0, f64::INFINITY).is_none());
+    let o = calm(900.0, 230.0)(1.0);
+    assert!(b.drop_repair(&o, &zi, 900.0 / 1400.0, 0, f64::INFINITY).is_some());
+}
+
+#[test]
+fn zap_cost_shape() {
+    use super::zap::zap_cost;
+    let c = [[0.0, 0.0, 0.0]];
+    assert_eq!(zap_cost(&c, [66.0, 0.0, 0.0], 66.0, 180.0), 0.0);
+    assert_eq!(zap_cost(&c, [90.0, 0.0, 0.0], 66.0, 180.0), 0.0);
+    let (a, b, d) = (zap_cost(&c, [55.0, 0.0, 0.0], 66.0, 180.0), zap_cost(&c, [30.0, 0.0, 0.0], 66.0, 180.0), zap_cost(&c, [0.0, 0.0, 0.0], 66.0, 180.0));
+    assert!(a > 0.0 && b > a && d > b);
+    assert!((b - 180.0 * (36.0 / 66.0) * (1.0 + 36.0 / 20.0)).abs() < 1e-9);
+    assert_eq!(zap_cost(&[], [0.0; 3], 66.0, 180.0), 0.0);
+}
+
+#[test]
+fn zap_field_and_items() {
+    let mut p = Params::default();
+    p.zap_avoid = 1.0;
+    let mut b = scene_brain(p);
+    let mut o = scene_obs(1.0, 1400.0);
+    o.mechs.push(enemy(7, [120.0, 0.0, 0.0], vec![WeaponKind::Gun, WeaponKind::Lightning]));
+    o.mechs.push(enemy(8, [-150.0, 0.0, 0.0], vec![WeaponKind::Gun]));
+    b.act(&o, &Budget::unlimited());
+    // only the lightning carrier counts, wherever it stands
+    assert_eq!(b.zap_carriers(&o).len(), 1);
+    assert!(!b.zap_item_ok(&o, [100.0, 30.0, 0.0]));
+    assert!(b.zap_item_ok(&o, [120.0, 70.0, 0.0]));
+    assert!(b.zap_item_ok(&o, [-150.0, 10.0, 0.0]));
+    // out of sight for a while: the carrier is forgotten
+    let mut late = scene_obs(4.0, 1400.0);
+    late.mechs.clear();
+    assert!(b.zap_carriers(&late).is_empty());
+    // carrying lightning with energy and health to spare: no field
+    let mut armed = o.clone();
+    armed.me.weapons[1] = Some(crate::proto::WeaponObs { kind: WeaponKind::Lightning, stats: crate::proto::Config::default().weapons.lightning.clone(), ..Default::default() });
+    assert!(b.zap_carriers(&armed).is_empty());
+    armed.me.hp = 600.0;
+    assert_eq!(b.zap_carriers(&armed).len(), 1);
+    // off by default
+    let mut b = scene_brain(Params::default());
+    b.act(&o, &Budget::unlimited());
+    assert!(b.zap_carriers(&o).is_empty() && b.zap_item_ok(&o, [100.0, 30.0, 0.0]));
+}
+
+#[test]
+fn zap_skips_drop_near_carrier() {
+    // hurt, hit by a lightning carrier 100 m west; the landed drop lies 40 m from it
+    let scene = |t: f64| {
+        let mut o = scene_obs(t, 900.0);
+        o.mechs.push(enemy(7, [-100.0, 0.0, 0.0], vec![WeaponKind::Gun, WeaponKind::Lightning]));
+        o.events.push(hit_by(7));
+        o.drops.push(landed_drop([-60.0, 0.0, 0.0]));
+        o
+    };
+    let mut p = Params::default();
+    p.drop_rep = 1.0;
+    assert_eq!(settle(p.clone(), scene).mode, Mode::Drop);
+    p.zap_avoid = 1.0;
+    assert_ne!(settle(p, scene).mode, Mode::Drop);
+}
+
+#[test]
+fn zap_pushes_the_path_away() {
+    // a carrier 40 m east, nothing else to do: with the field on we do not walk towards it
+    let scene = |t: f64| {
+        let mut o = scene_obs(t, 1400.0);
+        let mut e = enemy(7, [40.0, 0.0, 0.0], vec![WeaponKind::Gun, WeaponKind::Lightning]);
+        e.aim = [0.0, 0.0];
+        o.mechs.push(e);
+        o
+    };
+    let heading = |zap: f64| {
+        let mut p = Params::default();
+        p.zap_avoid = zap;
+        // a gun that wants to close in, so only the field can hold us back
+        p.range_gun = 20.0;
+        p.range_vs_lightning = 20.0;
+        let mut b = scene_brain(p);
+        let mut last = [0.0, 0.0];
+        for i in 0..8 {
+            let o = scene(1.0 + i as f64 * 0.1);
+            last = b.act(&o, &Budget::unlimited()).move_.unwrap();
+        }
+        last
+    };
+    assert!(heading(0.0)[0] > 0.3, "base should close in");
+    let with = heading(1.0);
+    assert!(with[0] < 0.2, "moving towards the carrier: {with:?}");
+}
+
+fn kill_ev(id: i64) -> crate::proto::Event {
+    crate::proto::Event::Kill(crate::proto::KillEv { target: id })
+}
+
+#[test]
+fn rest_after_kills() {
+    // hurt, nobody around; five kills reported one by one
+    let run = |p: Params, kills: usize| {
+        let mut b = scene_brain(p);
+        for i in 0..8 {
+            let mut o = scene_obs(1.0 + i as f64 * 0.1, 800.0);
+            if i < kills {
+                o.events.push(kill_ev(100 + i as i64));
+            }
+            b.act(&o, &Budget::unlimited());
+        }
+        b.mode
+    };
+    let mut p = Params::default();
+    assert_ne!(run(p.clone(), 5), Mode::Retreat, "off by default");
+    p.rest_kills = 5.0;
+    assert_ne!(run(p.clone(), 4), Mode::Retreat, "four kills are not enough");
+    assert_eq!(run(p.clone(), 5), Mode::Retreat);
+    // healed: no rest
+    let mut b = scene_brain(p);
+    for i in 0..8 {
+        let mut o = scene_obs(1.0 + i as f64 * 0.1, 1400.0);
+        if i < 5 {
+            o.events.push(kill_ev(100 + i as i64));
+        }
+        b.act(&o, &Budget::unlimited());
+    }
+    assert_ne!(b.mode, Mode::Retreat);
+}
+
+/// The bot already runs to the cubes a kill leaves behind (harvest_on): the kill site is remembered
+/// and its cubes are taken from farther away than ordinary loot while calm, from 18 m while a fight is on.
+#[test]
+fn kill_site_scoop_exists() {
+    let cube_id = 5000;
+    let run = |harvest: bool, attacked: bool| {
+        let mut p = Params::default();
+        p.harvest_on = harvest;
+        let mut b = scene_brain(p);
+        let mut o = scene_obs(1.0, 1400.0);
+        o.mechs.push(enemy(9, [140.0, 0.0, 0.0], vec![WeaponKind::Gun]));
+        b.act(&o, &Budget::unlimited());
+        for i in 0..6 {
+            let mut o = scene_obs(1.1 + i as f64 * 0.1, 1400.0);
+            if i == 0 {
+                o.events.push(kill_ev(9));
+            }
+            if attacked {
+                o.mechs.push(enemy(10, [-60.0, 0.0, 0.0], vec![WeaponKind::Gun]));
+                o.events.push(hit_by(10));
+            }
+            o.cubes.push(crate::proto::ItemObs { id: cube_id, pos: [142.0, 3.0, 0.0], hp: None });
+            b.act(&o, &Budget::unlimited());
+        }
+        (b.mode, b.goal_id)
+    };
+    // calm: 140 m is beyond the ordinary cube reach (110 m) but inside the kill-site reach
+    assert_ne!(run(false, false), (Mode::Loot, cube_id));
+    assert_eq!(run(true, false), (Mode::Loot, cube_id));
+    // mid-fight the run is limited to 18 m
+    assert_ne!(run(true, true), (Mode::Loot, cube_id));
+}
+
+#[test]
+fn duel_stance_engages_at_any_range() {
+    let scene = |alive: i64| {
+        move |t: f64| {
+            let mut o = scene_obs(t, 1400.0);
+            o.alive = alive;
+            o.mechs.push(enemy(7, [300.0, 0.0, 0.0], vec![WeaponKind::Gun]));
+            o
+        }
+    };
+    let mut p = Params::default();
+    assert_ne!(settle(p.clone(), scene(2)).mode, Mode::Fight, "off by default");
+    p.duel_on = 1.0;
+    assert_eq!(settle(p.clone(), scene(2)).mode, Mode::Fight);
+    assert_ne!(settle(p, scene(5)).mode, Mode::Fight, "only with two left");
+}
+
+/// fix_latch: a retreat that is interrupted by a quick item grab resumes until the exit health is reached,
+/// instead of falling back to the (stricter) entry rules and rejoining the fight hurt.
+#[test]
+fn retreat_survives_item_grab() {
+    let cube_id = 5001;
+    let run = |fix: bool| {
+        let mut p = Params::default();
+        p.gear_on = 1.0;
+        p.gear_grab_r = 40.0;
+        p.retreat_multi_hp = 0.65;
+        p.retreat_exit_hp = 0.8;
+        p.retreat_hp = 0.38;
+        p.retreat_press_hp = 0.0;
+        p.fix_latch = if fix { 1.0 } else { 0.0 };
+        let mut b = scene_brain(p);
+        let mut modes = Vec::new();
+        for i in 0..70 {
+            // 50% health; two attackers for the first ticks, then only one that no longer hits us
+            let mut o = scene_obs(1.0 + i as f64 * 0.1, 700.0);
+            o.mechs.push(enemy(9, [70.0, 0.0, 0.0], vec![WeaponKind::Gun]));
+            if i < 4 {
+                o.mechs.push(enemy(10, [-70.0, 10.0, 0.0], vec![WeaponKind::Gun]));
+                o.events.push(hit_by(9));
+                o.events.push(hit_by(10));
+            }
+            // a cube lies close by for six seconds (the pressure of the first hits has passed by then), then it is gone
+            if (4..64).contains(&i) {
+                o.cubes.push(crate::proto::ItemObs { id: cube_id, pos: [0.0, 20.0, 0.0], hp: None });
+            }
+            b.act(&o, &Budget::unlimited());
+            modes.push(b.mode);
+        }
+        modes
+    };
+    let (off, on) = (run(false), run(true));
+    assert_eq!(off[3], Mode::Retreat, "scene must start a retreat: {off:?}");
+    assert!(off[4..64].contains(&Mode::Loot), "scene must interrupt the retreat with a grab: {off:?}");
+    assert_eq!(on[..64], off[..64], "the fix must not change anything before the grab ends");
+    assert_eq!(*on.last().unwrap(), Mode::Retreat, "with the fix the retreat resumes: {on:?}");
+    assert_ne!(*off.last().unwrap(), Mode::Retreat, "without it the retreat is lost (the defect): {off:?}");
+}
+
+/// The "final" block of the settings file applies only in the final round and never changes the practice settings.
+#[test]
+fn final_block_only_in_final() {
+    let text = r#"{"ffa_on":1,"idle_frac":1.0,"final":{"ffa_force":1,"fix_latch":1,"acc_gain":0}}"#;
+    let plain = Params::parse(r#"{"ffa_on":1,"idle_frac":1.0}"#, false).unwrap();
+    let prac = Params::parse(text, false).unwrap();
+    let fin = Params::parse(text, true).unwrap();
+    assert_eq!(serde_json::to_string(&prac).unwrap(), serde_json::to_string(&plain).unwrap());
+    assert_eq!((prac.ffa_force, prac.fix_latch), (0.0, 0.0));
+    assert_eq!((fin.ffa_force, fin.fix_latch, fin.acc_gain, fin.ffa_on, fin.idle_frac), (1.0, 1.0, 0.0, 1.0, 1.0));
+    // a broken final block is an error for the final parse only
+    let bad = r#"{"ffa_on":1,"final":{"fix_latch":"x"}}"#;
+    assert!(Params::parse(bad, true).is_err());
+    assert_eq!(Params::parse(bad, false).unwrap().ffa_on, 1.0);
+}
+
+/// ffa_force: free-for-all play is on from the first decision, without waiting for evidence.
+#[test]
+fn ffa_forced_from_start() {
+    let run = |force: f64| {
+        let mut p = Params::default();
+        p.ffa_on = 1.0;
+        p.ffa_force = force;
+        let mut b = scene_brain(p);
+        b.act(&scene_obs(1.0, 1400.0), &Budget::unlimited());
+        b.ffa.on
+    };
+    assert!(!run(0.0));
+    assert!(run(1.0));
+}
+
+/// fix_retreat_fire: the retreat gate is worked out per mech, but only the best-scored mech's answer was kept.
+/// When that mech may not be fired at (a wounded one walking away), a third mech that is hitting us got no reply.
+#[test]
+fn retreat_answers_attacker() {
+    let run = |fix: bool| {
+        let mut p = Params::default();
+        p.fix_retreat_fire = if fix { 1.0 } else { 0.0 };
+        let mut b = scene_brain(p);
+        let st = crate::proto::Config::default().mech;
+        let mut aim = [0.0, 0.0];
+        let mut log = Vec::new();
+        for i in 0..53 {
+            // full health for half a second, then 57% with two mechs on us: the retreat starts and stays
+            let mut o = scene_obs(1.0 + i as f64 * 0.1, if i < 5 { 1400.0 } else { 800.0 });
+            o.me.aim = aim;
+            // the mech we were fighting: nearly dead, 80 m east, looking away; its last hit lands at tick 5
+            let mut weak = enemy(9, [80.0, 0.0, 0.0], vec![WeaponKind::Gun]);
+            weak.hp = Some(150.0);
+            weak.aim = [0.0, 0.0];
+            o.mechs.push(weak);
+            // a third mech 100 m north joins at tick 5 and keeps hitting us every second and a half
+            if i >= 5 {
+                o.mechs.push(enemy(10, [0.0, 100.0, 0.0], vec![WeaponKind::Gun]));
+            }
+            if i == 5 {
+                o.events.push(hit_by(9));
+            }
+            if i >= 5 && i % 15 == 5 {
+                o.events.push(hit_by(10));
+            }
+            let a = b.act(&o, &Budget::unlimited());
+            let fire = a.fire.unwrap();
+            let cmd = a.aim.unwrap();
+            aim = slew(aim, cmd, st.turn_rate * 0.1, st.pitch_rate * 0.1);
+            log.push((b.mode, fire[0] || fire[1], (cmd[0] * 100.0).round() / 100.0));
+        }
+        log
+    };
+    let (off, on) = (run(false), run(true));
+    // the weak mech counts as an attacker for 3 s after its hit (ticks 5 to 34): it may be fired at and nothing changes
+    assert!(off[5..34].iter().all(|x| x.0 == Mode::Retreat), "scene must retreat: {off:?}");
+    assert!(off[10..34].iter().any(|x| x.1 && x.2 == 0.0), "while it counts as an attacker the weak mech is fired at: {off:?}");
+    assert_eq!(on[..34], off[..34], "the fix must not change anything while the best-scored mech may be fired at");
+    // after that it is still the best-scored mech but the gate forbids it, while the third mech hits us at ticks 35 and 50
+    let north = ((PI / 2.0) * 100.0).round() / 100.0;
+    assert!(off[38..].iter().all(|x| x.0 == Mode::Retreat && !x.1 && x.2 == 0.0), "without the fix nobody is fired at (the defect): {off:?}");
+    assert!(on[38..].iter().all(|x| x.0 == Mode::Retreat && x.2 == north), "with the fix we turn to the mech that hits us: {on:?}");
+    assert!(on[42..].iter().all(|x| x.1), "and fire at it: {on:?}");
+}
+
+/// fix_keep_drop: laser seek runs after the main decision and replaced the drop goal even while we stood in the
+/// ring with capture progress banked, walking off to a laser pickup and losing the capture.
+#[test]
+fn laser_seek_keeps_banked_drop() {
+    let laser_id = 8001;
+    let run = |fix: bool, holder: i64| {
+        let mut p = Params::default();
+        p.lz_seek = 300.0;
+        p.fix_keep_drop = if fix { 1.0 } else { 0.0 };
+        let mut b = scene_brain(p);
+        let mut log = Vec::new();
+        for i in 0..30 {
+            let mut o = scene_obs(1.0 + i as f64 * 0.1, 1400.0);
+            // we stand 2 m from the centre of a landed drop; a laser pickup lies 100 m away
+            let mut d = landed_drop([2.0, 0.0, 0.0]);
+            // from tick 10 on the capture is running
+            if i >= 10 {
+                d.holder = Some(holder);
+                d.progress = (i - 9) as f64 * 0.1;
+            }
+            o.drops.push(d);
+            o.pickups.push(crate::proto::PickupObs { id: laser_id, kind: WeaponKind::Laser, pos: [0.0, 100.0, 0.0] });
+            b.act(&o, &Budget::unlimited());
+            log.push((b.mode, b.goal_id));
+        }
+        log
+    };
+    let (off, on) = (run(false, 1), run(true, 1));
+    assert!(off.iter().all(|x| *x == (Mode::Loot, laser_id)), "without the fix the laser wins even mid-capture (the defect): {off:?}");
+    assert_eq!(on[..10], off[..10], "the fix must not change anything before progress is banked");
+    assert!(on[10..].iter().all(|x| *x == (Mode::Drop, -1)), "with the fix the capture is finished first: {on:?}");
+    // somebody else's capture is not ours to protect
+    assert_eq!(run(true, 7), run(false, 7));
+    // and a drop the main decision did not choose is not held either: no drop mode, no change
+    let mut p = Params::default();
+    p.lz_seek = 300.0;
+    p.fix_keep_drop = 1.0;
+    let mut b = scene_brain(p);
+    let mut o = scene_obs(1.0, 1400.0);
+    o.pickups.push(crate::proto::PickupObs { id: laser_id, kind: WeaponKind::Laser, pos: [0.0, 100.0, 0.0] });
+    b.act(&o, &Budget::unlimited());
+    assert_eq!((b.mode, b.goal_id), (Mode::Loot, laser_id));
+}
+
+/// fix_npc_gone: a drone killed by someone else sends us no kill event, so its track stayed for 25 s and the
+/// bot kept walking to (and waiting at) the empty spot. With the fix a drone that is not reported although the
+/// place we last saw it is in plain view is forgotten after half a second.
+#[test]
+fn unseen_drone_is_forgotten() {
+    let drone_id = 300;
+    let run = |fix: bool, pos: V3| {
+        let mut p = Params::default();
+        p.fix_npc_gone = if fix { 1.0 } else { 0.0 };
+        let mut b = scene_brain(p);
+        let mut log = Vec::new();
+        for i in 0..60 {
+            // we look east the whole time; the drone is reported for the first second and then no more
+            let mut o = scene_obs(1.0 + i as f64 * 0.1, 1400.0);
+            if i < 10 {
+                o.mechs.push(crate::proto::ActorObs { id: drone_id, kind: crate::proto::ActorKind::Npc, pos, vel: [0.0; 3], aim: [0.0, 0.0], hp: Some(350.0), max_hp: Some(350.0), cubes: 0.0, weapons: Vec::new(), charging: false });
+            }
+            b.act(&o, &Budget::unlimited());
+            log.push((b.mode, b.goal_id, b.mem.tracks.len()));
+        }
+        log
+    };
+    // in front of us, 120 m away, in plain view
+    let (off, on) = (run(false, [120.0, 0.0, 0.0]), run(true, [120.0, 0.0, 0.0]));
+    assert_eq!(off[9], (Mode::Hunt, drone_id, 1), "scene must hunt the drone: {off:?}");
+    assert_eq!(*off.last().unwrap(), (Mode::Hunt, drone_id, 1), "without the fix it is still the destination 5 s after it vanished (the defect): {off:?}");
+    assert_eq!(on[..14], off[..14], "the fix must not change anything while the drone is seen, nor in the half second after");
+    assert!(on[16..].iter().all(|x| x.0 != Mode::Hunt && x.2 == 0), "with the fix the drone is forgotten: {on:?}");
+    // behind us and out of view: we cannot tell, so it is kept either way
+    let (off, on) = (run(false, [-120.0, 0.0, 0.0]), run(true, [-120.0, 0.0, 0.0]));
+    assert_eq!(on, off);
+    assert_eq!(on.last().unwrap().2, 1);
+}
+
+fn laser_obs() -> Option<crate::proto::WeaponObs> {
+    Some(crate::proto::WeaponObs { kind: WeaponKind::Laser, stats: crate::proto::Config::default().weapons.laser.clone(), ..Default::default() })
+}
+
+fn range_pref(b: &Brain) -> Option<f64> {
+    match b.goal {
+        Goal::Range { pref, .. } => Some(pref),
+        _ => None,
+    }
+}
+
+/// so_on: with a laser in hand the fight distance comes from the expected exchange (best at the cap, 200 m),
+/// a gun alone keeps its default, a lightning rush keeps its own distance, and a target well inside the wanted
+/// distance is backed away from with boost.
+#[test]
+fn laser_standoff_by_exchange() {
+    use super::standoff::Exchange;
+    let ex = |we_laser: bool, they_laser: bool| Exchange { gun: 102.0, laser: 131.0, we_gun: true, we_laser, they_gun: true, they_laser };
+    assert_eq!(ex(true, false).best(140.0, 200.0), 200.0);
+    assert_eq!(ex(true, true).best(140.0, 200.0), 200.0);
+    // a lower cap: against a laser carrier 180 m is still 10% better than 140 m, against a gun alone it is only 7% better
+    assert_eq!(ex(true, true).best(140.0, 180.0), 180.0);
+    assert_eq!(ex(true, false).best(140.0, 180.0), 140.0);
+    // a gun alone: the best distance is not 10% better than the default, so the default stays
+    assert_eq!(ex(false, false).best(85.0, 200.0), 85.0);
+
+    // scene: a mech with a gun stands `d` m east and looks away; `slots` is what we hold
+    let scene = |d: f64, slots: [Option<crate::proto::WeaponObs>; 2]| {
+        move |t: f64| {
+            let mut o = scene_obs(t, 1400.0);
+            o.me.weapons = slots.clone();
+            let mut e = enemy(7, [d, 0.0, 0.0], vec![WeaponKind::Gun]);
+            e.aim = [0.0, 0.0];
+            o.mechs.push(e);
+            o
+        }
+    };
+    let gun = scene_obs(0.0, 1.0).me.weapons[0].clone();
+    let lightning = Some(crate::proto::WeaponObs { kind: WeaponKind::Lightning, stats: crate::proto::Config::default().weapons.lightning.clone(), ..Default::default() });
+    let mut on = Params::default();
+    on.so_on = 1.0;
+    let off = Params::default();
+    // laser in hand: 140 m by default, 200 m with the model, 180 m with a lower cap
+    assert_eq!(range_pref(&settle(off.clone(), scene(100.0, [gun.clone(), laser_obs()]))), Some(140.0));
+    assert_eq!(range_pref(&settle(on.clone(), scene(100.0, [gun.clone(), laser_obs()]))), Some(200.0));
+    let mut cap = on.clone();
+    cap.so_cap = 190.0;
+    assert_eq!(range_pref(&settle(cap, scene(100.0, [gun.clone(), laser_obs()]))), Some(190.0));
+    // gun only: unchanged
+    assert_eq!(range_pref(&settle(off.clone(), scene(100.0, [gun.clone(), None]))), Some(85.0));
+    assert_eq!(range_pref(&settle(on.clone(), scene(100.0, [gun.clone(), None]))), Some(85.0));
+    // lightning in hand keeps its own distance
+    assert_eq!(range_pref(&settle(on.clone(), scene(100.0, [lightning.clone(), laser_obs()]))), Some(30.0));
+
+    // 100 m is more than 18 m inside 200 m: back off with boost; without the setting we walk out to 140 m
+    let step = |p: Params, d: f64| {
+        let mut b = scene_brain(p);
+        let mut a = None;
+        for i in 0..6 {
+            let o = scene(d, [gun.clone(), laser_obs()])(1.0 + i as f64 * 0.1);
+            a = Some(b.act(&o, &Budget::unlimited()));
+        }
+        let a = a.unwrap();
+        (a.move_.unwrap(), a.boost.unwrap(), b.mode)
+    };
+    let (mv, boost, mode) = step(on.clone(), 100.0);
+    assert!(mode == Mode::Fight && boost && mv[0] < -0.5, "must boost away: {mv:?} {boost} {mode:?}");
+    let (mv, boost, _) = step(off.clone(), 100.0);
+    assert!(!boost && mv[0] < 0.0, "default walks away without boost: {mv:?} {boost}");
+    // the mech we are fighting is kept out to the stand-off distance although it is beyond the engage range
+    let drift = |p: Params| {
+        let mut b = scene_brain(p);
+        for i in 0..12 {
+            let d = if i < 6 { 100.0 } else { 195.0 };
+            let o = scene(d, [gun.clone(), laser_obs()])(1.0 + i as f64 * 0.1);
+            b.act(&o, &Budget::unlimited());
+        }
+        b.mode
+    };
+    assert_eq!(drift(on), Mode::Fight);
+    assert_ne!(drift(off), Mode::Fight);
+}
