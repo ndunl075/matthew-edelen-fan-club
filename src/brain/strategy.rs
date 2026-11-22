@@ -292,6 +292,8 @@ impl Brain {
                 goal_id = id;
             } else if let Some(q) = self.prep_goal() {
                 goal = Goal::Nav { pos: q, arrive: 3.0 };
+            } else if let Some(q) = self.wall_goal(obs, world, nav) {
+                goal = Goal::Nav { pos: q, arrive: 2.0 };
             } else {
                 goal = Goal::Field { center: obs.zone.next_center, arrive: 2.0 };
             }
@@ -560,6 +562,75 @@ impl Brain {
         v.sort_by(|a, b| a.0.total_cmp(&b.0));
         v.truncate(4);
         v.into_iter().map(|x| x.1).collect()
+    }
+
+    /// Idle spot with a building wall or corner at our back: fewer open sides to be seen or shot from.
+    /// Kept for the whole zone phase; looked for at most once a second within the time budget.
+    pub(crate) fn wall_goal(&mut self, obs: &Obs, world: &World, nav: &Nav) -> Option<V3> {
+        let p = self.p.clone();
+        if p.wall_on <= 0.0 {
+            return None;
+        }
+        let z = &obs.zone;
+        let seed_r = self.seed_radius(z);
+        let c = z.next_center;
+        if seed_r < p.wall_min_r || !(c[0].is_finite() && c[1].is_finite()) {
+            self.wall = None;
+            return None;
+        }
+        let key = [c[0], c[1], z.next_radius];
+        if let Some((q, k)) = self.wall {
+            if (k[0] - key[0]).abs() < 0.5 && (k[1] - key[1]).abs() < 0.5 && (k[2] - key[2]).abs() < 0.5 && dist2v(q, c) <= seed_r {
+                return Some(q);
+            }
+            self.wall = None;
+        }
+        if obs.t - self.wall_try_t < 1.0 {
+            return None;
+        }
+        self.wall_try_t = obs.t;
+        let pos = obs.me.pos;
+        let h = obs.me.stats.height.max(1.0);
+        let blocked = |q: V3| -> f64 {
+            let e = up(q, h * 0.6);
+            let mut n = 0.0;
+            for k in 0..16 {
+                let a = k as f64 * std::f64::consts::PI / 8.0;
+                let b = [e[0] + p.wall_ray * a.cos(), e[1] + p.wall_ray * a.sin(), e[2]];
+                if !world.sight_no_trees(e, b) {
+                    n += 1.0;
+                }
+            }
+            n
+        };
+        let mut best: Option<(f64, V3)> = None;
+        'outer: for &r in &[0.0, 15.0, 30.0, 45.0, 60.0, 80.0] {
+            let n = if r == 0.0 { 1 } else { 16 };
+            for k in 0..n {
+                if self.t_act.elapsed().as_secs_f64() > p.wall_budget_s {
+                    break 'outer;
+                }
+                let a = k as f64 * 2.0 * std::f64::consts::PI / n as f64 + r * 0.05;
+                let x = pos[0] + r * a.cos();
+                let y = pos[1] + r * a.sin();
+                let q0 = [x, y, fin(world.floor_below(x, y, pos[2] + 3.0), pos[2])];
+                let Some(q) = nav.snap(q0) else { continue };
+                if dist(q, q0) > 6.0 || !q.iter().all(|v| v.is_finite()) || dist2v(q, c) > seed_r {
+                    continue;
+                }
+                let s = blocked(q);
+                if s < p.wall_min_block || s > 14.0 {
+                    continue;
+                }
+                let v = s - p.wall_w_dist * dist(q, pos);
+                if best.map_or(true, |b| v > b.0) {
+                    best = Some((v, q));
+                }
+            }
+        }
+        let (_, q) = best?;
+        self.wall = Some((q, key));
+        Some(q)
     }
 
     fn cover_goal(&mut self, obs: &Obs, world: &World, nav: &Nav, zi: &ZoneInfo) -> Goal {

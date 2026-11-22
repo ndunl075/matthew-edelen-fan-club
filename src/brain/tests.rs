@@ -358,3 +358,46 @@ fn stress_timing() {
     eprintln!("stress: p50 {:.2} ms  p90 {:.2}  p99 {:.2}  max {:.2}  fired on {fired}/400", times[200], times[360], times[396], times[399]);
     assert!(times[399] < 40.0);
 }
+
+/// Set MECH_MAP to the map dir to run: wall_goal finds a walled spot on the real map, within budget.
+#[test]
+fn wall_spots_on_map() {
+    let Ok(dir) = std::env::var("MECH_MAP") else { return };
+    let hello = crate::proto::Hello::default();
+    let shared = Arc::new(Shared::load(std::path::Path::new(&dir), &hello.config));
+    let mut p = Params::default();
+    p.wall_on = 1.0;
+    p.idle_frac = 1.0;
+    let mut b = Brain::with_params(&hello, shared.clone(), p);
+    let nav = &shared.nav;
+    let n = nav.node_count() as u32;
+    let (mut found, mut tried, mut worst_ms, mut moved) = (0, 0, 0.0f64, 0.0);
+    let mut seed = 12345u64;
+    for _ in 0..200 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let i = ((seed >> 33) % n as u64) as u32;
+        if nav.node_roof(i) {
+            continue;
+        }
+        let q = nav.node_pos(i);
+        let js = format!(
+            r#"{{"tick":2,"t":{t},"self":{{"id":1,"pos":[{x},{y},{z}],"hp":1400,"max_hp":1400,"weapons":[null,null],"stats":{{"walk_speed":11.7,"radius":2.5,"height":9,"turn_rate":4}}}},
+            "zone":{{"center":[{x},{y}],"radius":400,"next_center":[{x},{y}],"next_radius":240}}}}"#,
+            t = 10.0 + tried as f64 * 2.0, x = q[0], y = q[1], z = q[2]
+        );
+        let o: crate::proto::Obs = serde_json::from_str(&js).unwrap();
+        b.wall = None;
+        b.wall_try_t = -1e9;
+        b.t_act = std::time::Instant::now();
+        let r = b.wall_goal(&o, &shared.world, nav);
+        worst_ms = worst_ms.max(b.t_act.elapsed().as_secs_f64() * 1000.0);
+        tried += 1;
+        if let Some(w) = r {
+            found += 1;
+            moved += crate::brain::math::dist(w, q);
+        }
+    }
+    eprintln!("wall spots: found {found}/{tried}, mean move {:.1} m, worst {worst_ms:.1} ms", moved / found.max(1) as f64);
+    assert!(found * 2 > tried, "found only {found}/{tried}");
+    assert!(worst_ms < 25.0);
+}
